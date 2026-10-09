@@ -1,0 +1,1676 @@
+From 610c83fc07bcbf7cf266984f6698e8e00bc3ab88 Mon Sep 17 00:00:00 2001
+From: donghun <ehdgns1083@pusan.ac.kr>
+Date: Fri, 9 Oct 2026 12:32:07 +0900
+Subject: [PATCH] fpga: add VCU118 (xcvu9p) top-level with BSCANE2 debug
+ transport
+
+Port chip_nexus to the AMD VCU118 board. Programs are loaded through the
+FPGA's own JTAG port (BSCANE2 USER3/USER4 -> pulp riscv-dbg DTM), so no
+extra cable is needed. A small boot ROM prints a banner on the USB-UART
+and parks the core until OpenOCD loads a program. DDR4 is not connected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HsWEz2ez3LV2MFsUt4sHDc
+---
+ fpga/BUILD                     | 120 +++++++++++
+ fpga/chip_vcu118.core          | 147 +++++++++++++
+ fpga/pins_vcu118.xdc           |  58 ++++++
+ fpga/rtl/chip_vcu118.sv        | 294 ++++++++++++++++++++++++++
+ fpga/rtl/clkgen_vcu118.sv      | 115 +++++++++++
+ fpga/rtl/dmi_bscane_tap.sv     |  85 ++++++++
+ fpga/rtl/dmi_jtag_bscane.sv    | 362 +++++++++++++++++++++++++++++++++
+ fpga/sw/vcu118/hello.c         |  31 +++
+ fpga/sw/vcu118/rom_park.c      |  54 +++++
+ fpga/vcu118/README.md          |  63 ++++++
+ fpga/vcu118/gen_openocd_cfg.sh |  80 ++++++++
+ fpga/vcu118/load_elf.sh        |  27 +++
+ fpga/vcu118_pre_opt_hooks.tcl  |  37 ++++
+ fpga/vcu118_setup_hooks.tcl    |  74 +++++++
+ 14 files changed, 1547 insertions(+)
+ create mode 100644 fpga/chip_vcu118.core
+ create mode 100644 fpga/pins_vcu118.xdc
+ create mode 100644 fpga/rtl/chip_vcu118.sv
+ create mode 100644 fpga/rtl/clkgen_vcu118.sv
+ create mode 100644 fpga/rtl/dmi_bscane_tap.sv
+ create mode 100644 fpga/rtl/dmi_jtag_bscane.sv
+ create mode 100644 fpga/sw/vcu118/hello.c
+ create mode 100644 fpga/sw/vcu118/rom_park.c
+ create mode 100644 fpga/vcu118/README.md
+ create mode 100755 fpga/vcu118/gen_openocd_cfg.sh
+ create mode 100755 fpga/vcu118/load_elf.sh
+ create mode 100644 fpga/vcu118_pre_opt_hooks.tcl
+ create mode 100644 fpga/vcu118_setup_hooks.tcl
+
+diff --git a/fpga/BUILD b/fpga/BUILD
+index ef82ce5..cf2fe30 100644
+--- a/fpga/BUILD
++++ b/fpga/BUILD
+@@ -912,3 +912,123 @@ genrule(
+ )
+ 
+ collect_coralnpu_elfs()
++
++# -----------------------------------------------------------------------------
++# VCU118 (xcvu9p-flga2104-2L-e)
++#
++# Debug transport goes over the FPGA's own JTAG (BSCANE2), so the board needs
++# no extra cable. The SoC boots a small ROM (sw/vcu118/rom_park.c) that prints
++# a banner on the USB-UART and parks; programs are then loaded with OpenOCD.
++# DDR4 is not connected in this build (see rtl/chip_vcu118.sv).
++#
++#   bazel build //fpga:build_chip_vcu118_synth_only_vector_normal   # LUT count
++#   bazel build //fpga:build_chip_vcu118_bitstream_vector_normal    # .bit
++#   bazel build //fpga:vcu118_hello                                 # first ELF
++# -----------------------------------------------------------------------------
++
++coralnpu_v2_binary(
++    name = "vcu118_rom_park",
++    srcs = ["sw/vcu118/rom_park.c"],
++    crt = ":rom_boot_crt0",
++    linker_script = "sw/rom_boot/rom.ld",
++    deps = [
++        ":clk",
++        ":gpio",
++        ":uart",
++    ],
++)
++
++coralnpu_v2_binary(
++    name = "vcu118_rom_park_highmem",
++    srcs = ["sw/vcu118/rom_park.c"],
++    crt = ":rom_boot_crt0",
++    linker_script = "sw/rom_boot/rom_highmem.ld",
++    deps = [
++        ":clk",
++        ":gpio",
++        ":uart",
++    ],
++)
++
++filegroup(
++    name = "vcu118_rom_park_vmem",
++    srcs = [":vcu118_rom_park"],
++    output_group = "vmem_file",
++)
++
++filegroup(
++    name = "vcu118_rom_park_highmem_vmem",
++    srcs = [":vcu118_rom_park_highmem"],
++    output_group = "vmem_file",
++)
++
++coralnpu_v2_binary(
++    name = "vcu118_hello",
++    srcs = ["sw/vcu118/hello.c"],
++    deps = [":uart"],
++)
++
++VCU118_VIVADO_HOOKS = [
++    "vcu118_setup_hooks.tcl",
++    "vcu118_pre_opt_hooks.tcl",
++    "check_pin_assignments.tcl",
++    "vivado_post_place_hooks.tcl",
++    "vivado_post_route_hooks.tcl",
++]
++
++VCU118_COMMON_SRCS = CORALNPU_SOC_SRCS_COMMON + [
++    "pins_vcu118.xdc",
++] + VCU118_VIVADO_HOOKS
++
++VCU118_COMMON_CORES = [
++    ":chip_vcu118.core",
++    "//fpga/ip/i2c_master:i2c_master.core",
++    "//fpga/ip/ispyocto:ispyocto_core",
++]
++
++# Only the vector (no VME) variants: they are the ones sized for a VU9P.
++_VCU118_CONFIGS = [
++    dict(c, park_vmem = ":vcu118_rom_park_vmem", park_vmem_file = "$(location :vcu118_rom_park_vmem)")
++    for c in _ALL_CONFIGS
++    if c["name"] == "vector_normal"
++] + [
++    dict(c, park_vmem = ":vcu118_rom_park_highmem_vmem", park_vmem_file = "$(location :vcu118_rom_park_highmem_vmem)")
++    for c in _ALL_CONFIGS
++    if c["name"] == "vector_highmem"
++]
++
++_VCU118_NAME_MAP = {
++    "build_chip_vcu118_" + build_type + c["suffix"]: {
++        "cores": CORALNPU_SOC_CORES_COMMON + VCU118_COMMON_CORES + [c["chisel_core"]],
++        "srcs": VCU118_COMMON_SRCS + [c["chisel_rtl"], c["park_vmem"]],
++        "flags": [
++            "--ClockFrequencyMhz=" + c["clock_frequency_mhz"],
++            "--IspClockFrequencyMhz=" + _ISP_CLOCK_FREQUENCY_MHZ,
++            "--SpimClockFrequencyMhz=" + _SPIM_CLOCK_FREQUENCY_MHZ,
++            "--ItcmSizeKBytes=" + c["itcm"],
++            "--DtcmSizeKBytes=" + c["dtcm"],
++            # Boot the park ROM; the autoboot FSM releases the core's clock
++            # gate and reset at power-up, so no host write is needed.
++            "--EnableAutoboot=1",
++            "--MemInitFile=" + c["park_vmem_file"],
++            "--BootAddr=268435456",
++        ] + (["--pnr=none"] if build_type in ("synth_only", "elab_only") else []),
++        "target": "elab" if build_type == "elab_only" else "synth",
++    }
++    for c in _VCU118_CONFIGS
++    for build_type in [
++        "bitstream",
++        "synth_only",
++        "elab_only",
++    ]
++}
++
++template_rule(
++    fusesoc_build,
++    _VCU118_NAME_MAP,
++    output_groups = {
++        "all": ["com.google.coralnpu_fpga_chip_vcu118_0.1/"],
++    },
++    systems = ["com.google.coralnpu:fpga:chip_vcu118:0.1"],
++    tags = ["manual"],
++)
+diff --git a/fpga/chip_vcu118.core b/fpga/chip_vcu118.core
+new file mode 100644
+index 0000000..8c6f5a8
+--- /dev/null
++++ b/fpga/chip_vcu118.core
+@@ -0,0 +1,147 @@
++CAPI=2:
++# Copyright 2025 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++name: "com.google.coralnpu:fpga:chip_vcu118:0.1"
++description: "VCU118-specific top-level for CoralNPU (BSCANE2 debug, no DDR)."
++
++filesets:
++  files_rtl:
++    depend:
++      - com.google.coralnpu:fpga:coralnpu_soc
++      - pulp-platform:riscv-dbg:0.1
++    files:
++      - rtl/dmi_bscane_tap.sv
++      - rtl/dmi_jtag_bscane.sv
++      - rtl/clkgen_vcu118.sv
++      - rtl/chip_vcu118.sv
++    file_type: systemVerilogSource
++
++  files_constraints:
++    files:
++      - pins_vcu118.xdc
++    file_type: xdc
++
++  files_tcl:
++    files:
++      - vcu118_setup_hooks.tcl: { file_type: tclSource }
++      - check_pin_assignments.tcl: { file_type: user, copyto: check_pin_assignments.tcl }
++      - vcu118_pre_opt_hooks.tcl: { file_type: user, copyto: vcu118_pre_opt_hooks.tcl }
++      - vivado_post_place_hooks.tcl: { file_type: user, copyto: vivado_post_place_hooks.tcl }
++      - vivado_post_route_hooks.tcl: { file_type: user, copyto: vivado_post_route_hooks.tcl }
++
++parameters:
++  ClockFrequencyMhz:
++    datatype: int
++    description: "Target clock frequency in MHz."
++    default: 50
++    paramtype: vlogparam
++  IspClockFrequencyMhz:
++    datatype: int
++    description: "ISP clock frequency in MHz."
++    default: 10
++    paramtype: vlogparam
++  SpimClockFrequencyMhz:
++    datatype: int
++    description: "SPIM clock frequency in MHz."
++    default: 100
++    paramtype: vlogparam
++  MemInitFile:
++    datatype: str
++    description: Path to ROM
++    default: ""
++    paramtype: vlogparam
++  BootAddr:
++    datatype: int
++    description: "PC reset value. 0 for ITCM, 0x10000000 for ROM boot."
++    default: 0
++    paramtype: vlogparam
++  EnableAutoboot:
++    datatype: int
++    description: "Enable autonomous boot release"
++    default: 0
++    paramtype: vlogparam
++  ItcmSizeKBytes:
++    datatype: int
++    description: "ITCM size in KBytes"
++    default: 8
++    paramtype: vlogparam
++  DtcmSizeKBytes:
++    datatype: int
++    description: "DTCM size in KBytes"
++    default: 32
++    paramtype: vlogparam
++  AddrWidth:
++    datatype: int
++    description: "Address width in bits"
++    default: 32
++    paramtype: vlogparam
++  USE_GENERIC:
++    datatype: bool
++    description: "Use generic primitives"
++    default: false
++    paramtype: vlogdefine
++  FPGA_XILINX:
++    datatype: bool
++    description: "Use Xilinx FPGA primitives"
++    default: false
++    paramtype: vlogdefine
++  TB_SUPPORT:
++    datatype: bool
++    description: "Enable TB support in RVV"
++    default: true
++    paramtype: vlogdefine
++  VLEN_128:
++    datatype: bool
++    description: "Set RVV VLEN to 128"
++    default: true
++    paramtype: vlogdefine
++  ZVE32F_ON:
++    datatype: bool
++    description: "Enable ZVE32F RVV profile"
++    default: true
++    paramtype: vlogdefine
++  ZVT_ON:
++    datatype: bool
++    description: "Enable ZVT extension"
++    paramtype: vlogdefine
++
++targets:
++  default: &default_target
++    filesets:
++      - files_rtl
++      - files_constraints
++      - files_tcl
++  synth:
++    <<: *default_target
++    toplevel: chip_vcu118
++    default_tool: vivado
++    parameters:
++      - ClockFrequencyMhz
++      - IspClockFrequencyMhz
++      - SpimClockFrequencyMhz
++      - MemInitFile
++      - BootAddr
++      - EnableAutoboot
++      - ItcmSizeKBytes
++      - DtcmSizeKBytes
++      - AddrWidth
++      - USE_GENERIC=true
++      - FPGA_XILINX=true
++      - TB_SUPPORT=true
++      - VLEN_128=true
++      - ZVE32F_ON=true
++      - ZVT_ON
++    tools:
++      vivado:
++        part: "xcvu9p-flga2104-2L-e"
+diff --git a/fpga/pins_vcu118.xdc b/fpga/pins_vcu118.xdc
+new file mode 100644
+index 0000000..eb654d3
+--- /dev/null
++++ b/fpga/pins_vcu118.xdc
+@@ -0,0 +1,58 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++# VCU118 (xcvu9p-flga2104-2L-e) pin constraints for chip_vcu118.
++#
++# Every LOC / IOSTANDARD below is taken from the AMD board file
++# XilinxBoardStore boards/Xilinx/vcu118/2.4/part0_pins.xml and board.xml
++# (branch 2024.1), the same data Vivado uses when you pick the VCU118 board.
++
++## 125 MHz system clock (SYSCLK_125_P/N, LVDS)
++set_property -dict { PACKAGE_PIN AY24 IOSTANDARD LVDS } [get_ports sysclk_125_p]
++set_property -dict { PACKAGE_PIN AY23 IOSTANDARD LVDS } [get_ports sysclk_125_n]
++create_clock -period 8.000 -name sysclk_125 [get_ports sysclk_125_p]
++
++## CPU_RESET push button (active high)
++set_property -dict { PACKAGE_PIN L19 IOSTANDARD LVCMOS12 } [get_ports cpu_reset]
++set_false_path -from [get_ports cpu_reset]
++
++## USB-UART (Silicon Labs CP2105). Directions per board.xml rs232_uart:
++##   TxD (FPGA out) -> USB_UART_TX, RxD (FPGA in) <- USB_UART_RX
++set_property -dict { PACKAGE_PIN BB21 IOSTANDARD LVCMOS18 } [get_ports uart_txd]
++set_property -dict { PACKAGE_PIN AW25 IOSTANDARD LVCMOS18 } [get_ports uart_rxd]
++set_false_path -to   [get_ports uart_txd]
++set_false_path -from [get_ports uart_rxd]
++
++## User LEDs GPIO_LED_0..7 (active high)
++set_property -dict { PACKAGE_PIN AT32 IOSTANDARD LVCMOS12 DRIVE 8 } [get_ports {led[0]}]
++set_property -dict { PACKAGE_PIN AV34 IOSTANDARD LVCMOS12 DRIVE 8 } [get_ports {led[1]}]
++set_property -dict { PACKAGE_PIN AY30 IOSTANDARD LVCMOS12 DRIVE 8 } [get_ports {led[2]}]
++set_property -dict { PACKAGE_PIN BB32 IOSTANDARD LVCMOS12 DRIVE 8 } [get_ports {led[3]}]
++set_property -dict { PACKAGE_PIN BF32 IOSTANDARD LVCMOS12 DRIVE 8 } [get_ports {led[4]}]
++set_property -dict { PACKAGE_PIN AU37 IOSTANDARD LVCMOS12 DRIVE 8 } [get_ports {led[5]}]
++set_property -dict { PACKAGE_PIN AV36 IOSTANDARD LVCMOS12 DRIVE 8 } [get_ports {led[6]}]
++set_property -dict { PACKAGE_PIN BA37 IOSTANDARD LVCMOS12 DRIVE 8 } [get_ports {led[7]}]
++set_false_path -to [get_ports {led[*]}]
++
++## JTAG debug clock from BSCANE2 (the FPGA's TCK). The DMI CDC (dmi_cdc)
++## synchronises between TCK and the core clock, so the domains are async.
++## OpenOCD on the on-board JTAG runs well below 30 MHz; 33.3 ns is a safe bound.
++create_clock -period 33.333 -name jtag_tck [get_pins -hierarchical -filter {NAME =~ *i_tap_dtmcs/TCK}]
++
++set_clock_groups -asynchronous \
++  -group [get_clocks -include_generated_clocks sysclk_125] \
++  -group [get_clocks jtag_tck]
++
++## Bitstream settings
++set_property BITSTREAM.GENERAL.COMPRESS TRUE [current_design]
+diff --git a/fpga/rtl/chip_vcu118.sv b/fpga/rtl/chip_vcu118.sv
+new file mode 100644
+index 0000000..6fc8200
+--- /dev/null
++++ b/fpga/rtl/chip_vcu118.sv
+@@ -0,0 +1,294 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// CoralNPU SoC top-level for the AMD/Xilinx VCU118 (xcvu9p-flga2104-2L-e).
++//
++// Derived from chip_nexus.sv. Differences:
++//   * Clock: 125 MHz LVDS SYSCLK (AY24/AY23) through clkgen_vcu118.
++//   * Reset: CPU_RESET push button (L19), active HIGH on this board.
++//   * Debug: RISC-V debug transport over the FPGA's own JTAG port via BSCANE2
++//            (USER3 = DTMCS, USER4 = DMI). No extra pins or cables: OpenOCD
++//            talks to the same USB-JTAG used to load the bitstream.
++//   * UART:  the software console is UART1 (0x4001_0000, see fpga/sw/uart.c),
++//            so UART1 goes to the on-board CP2105 USB-UART. UART0 is unused.
++//   * DDR4:  not connected yet. The SoC's DDR AXI ports are tied off exactly
++//            like fpga/ip/ddr4_stub (never ready), so any access to
++//            0x8000_0000.. hangs the bus. Do not touch DDR on this build.
++//   * SPI device / SPI host / SPI flash / I2C / camera: not connected.
++//   * LEDs: [0] MMCM locked [1] heartbeat [2] io_halted [3] io_fault
++//           [7:4] SoC GPIO[3:0]
++module chip_vcu118 #(
++    parameter MemInitFile = "",
++    parameter int ClockFrequencyMhz = 50,
++    parameter int IspClockFrequencyMhz = 10,
++    parameter int SpimClockFrequencyMhz = 100,
++    parameter int EnableAutoboot = 0,
++    parameter int ItcmSizeKBytes = 8,
++    parameter int DtcmSizeKBytes = 32,
++    parameter int AddrWidth = 32,
++    parameter logic [AddrWidth-1:0] BootAddr = 0
++) (
++    input  logic       sysclk_125_p,
++    input  logic       sysclk_125_n,
++    input  logic       cpu_reset,     // active high push button
++    output logic       uart_txd,      // FPGA -> CP2105 (USB_UART_TX)
++    input  logic       uart_rxd,      // CP2105 -> FPGA (USB_UART_RX)
++    output logic [7:0] led
++);
++
++  // ------------------------------------------------------------------
++  // Clocks and reset
++  // ------------------------------------------------------------------
++  logic clk, clk_isp, clk_spim;
++  logic rst_n, locked;
++
++  clkgen_vcu118 #(
++      .ClockFrequencyMhz(ClockFrequencyMhz)
++  ) i_clkgen (
++      .clk_p_i   (sysclk_125_p),
++      .clk_n_i   (sysclk_125_n),
++      .rst_ni    (~cpu_reset),
++      .clk_main_o(clk),
++      .clk_isp_o (clk_isp),
++      .clk_spim_o(clk_spim),
++      .rst_no    (rst_n),
++      .locked_o  (locked)
++  );
++
++  // ------------------------------------------------------------------
++  // UART: console on UART1
++  // ------------------------------------------------------------------
++  top_pkg::uart_sideband_i_t [1:0] uart_sideband_i;
++  top_pkg::uart_sideband_o_t [1:0] uart_sideband_o;
++
++  assign uart_sideband_i[0].cio_rx = 1'b1;  // idle
++  assign uart_sideband_i[1].cio_rx = uart_rxd;
++  assign uart_txd = uart_sideband_o[1].cio_tx;
++
++  // ------------------------------------------------------------------
++  // GPIO / status LEDs
++  // ------------------------------------------------------------------
++  logic [7:0] gpio_out, gpio_en;
++  logic io_halted, io_fault;
++
++  // ~1.5 Hz at 50 MHz: proves the main clock is alive without any software.
++  logic [24:0] heartbeat_q;
++  always_ff @(posedge clk or negedge rst_n) begin
++    if (!rst_n) heartbeat_q <= '0;
++    else heartbeat_q <= heartbeat_q + 1'b1;
++  end
++
++  assign led[0]   = locked;
++  assign led[1]   = heartbeat_q[24];
++  assign led[2]   = io_halted;
++  assign led[3]   = io_fault;
++  assign led[7:4] = gpio_out[3:0] & gpio_en[3:0];
++
++  // ------------------------------------------------------------------
++  // RISC-V debug transport over BSCANE2
++  // ------------------------------------------------------------------
++  logic dm_req_valid, dm_req_ready;
++  dm::dmi_req_t dm_req;
++  logic dm_rsp_valid, dm_rsp_ready;
++  dm::dmi_resp_t dm_rsp;
++
++  dmi_jtag_bscane #(
++      // Not visible on the wire: with BSCANE2 the FPGA's own IDCODE is used.
++      .IdcodeValue(32'h04f5484d)
++  ) i_dmi_jtag (
++      .clk_i           (clk),
++      .rst_ni          (rst_n),
++      .testmode_i      (1'b0),
++      .test_rst_ni     (1'b1),
++      .dmi_rst_no      (),
++      .dmi_req_o       (dm_req),
++      .dmi_req_valid_o (dm_req_valid),
++      .dmi_req_ready_i (dm_req_ready),
++      .dmi_resp_i      (dm_rsp),
++      .dmi_resp_ready_o(dm_rsp_ready),
++      .dmi_resp_valid_i(dm_rsp_valid),
++      .tck_i           (1'b0),
++      .tms_i           (1'b0),
++      .trst_ni         (1'b1),
++      .td_i            (1'b0),
++      .td_o            (),
++      .tdo_oe_o        ()
++  );
++
++  // ------------------------------------------------------------------
++  // DDR AXI tie-off (same behaviour as fpga/ip/ddr4_stub: never ready)
++  // ------------------------------------------------------------------
++  logic ddr_ctrl_aw_valid, ddr_ctrl_w_valid, ddr_ctrl_ar_valid;
++  logic ddr_mem_aw_valid, ddr_mem_w_valid, ddr_mem_ar_valid;
++
++  // ------------------------------------------------------------------
++  // SoC
++  // ------------------------------------------------------------------
++  coralnpu_soc #(
++      .MemInitFile          (MemInitFile),
++      .ClockFrequencyMhz    (ClockFrequencyMhz),
++      .IspClockFrequencyMhz (IspClockFrequencyMhz),
++      .SpimClockFrequencyMhz(SpimClockFrequencyMhz),
++      .EnableAutoboot       (EnableAutoboot),
++      .ItcmSizeKBytes       (ItcmSizeKBytes),
++      .DtcmSizeKBytes       (DtcmSizeKBytes),
++      .AddrWidth            (AddrWidth)
++  ) i_coralnpu_soc (
++      .clk_i            (clk),
++      .clk_isp_i        (clk_isp),
++      .rst_ni           (rst_n),
++      // SPI device (host loader on Nexus): idle
++      .spi_clk_i        (1'b0),
++      .spi_csb_i        (1'b1),
++      .spi_mosi_i       (1'b0),
++      .spi_miso_o       (),
++      // SPI host: unconnected
++      .spim_sclk_o      (),
++      .spim_csb_o       (),
++      .spim_mosi_o      (),
++      .spim_miso_i      (1'b0),
++      .spim_clk_i       (clk_spim),
++      .boot_addr_i      (BootAddr),
++      // SPI flash: unconnected
++      .spim_flash_sclk_o(),
++      .spim_flash_csb_o (),
++      .spim_flash_mosi_o(),
++      .spim_flash_miso_i(1'b0),
++      .spim_flash_clk_i (clk_spim),
++      .spim_flash_rst_no(),
++      .gpio_o           (gpio_out),
++      .gpio_en_o        (gpio_en),
++      .gpio_i           (8'h00),
++      // Camera / ISP: no sensor on this board
++      .ISP_DVP_D0       (1'b0),
++      .ISP_DVP_D1       (1'b0),
++      .ISP_DVP_D2       (1'b0),
++      .ISP_DVP_D3       (1'b0),
++      .ISP_DVP_D4       (1'b0),
++      .ISP_DVP_D5       (1'b0),
++      .ISP_DVP_D6       (1'b0),
++      .ISP_DVP_D7       (1'b0),
++      .ISP_DVP_PCLK     (1'b0),
++      .ISP_DVP_HSYNC    (1'b0),
++      .ISP_DVP_VSYNC    (1'b0),
++      .CAM_INT          (1'b0),
++      .CAM_TRIG         (),
++      .scanmode_i       (prim_mubi_pkg::MuBi4False),
++      .uart_sideband_i  (uart_sideband_i),
++      .uart_sideband_o  (uart_sideband_o),
++      // I2C: pulled-up idle bus
++      .scl_i            (1'b1),
++      .scl_o            (),
++      .scl_en_o         (),
++      .sda_i            (1'b1),
++      .sda_o            (),
++      .sda_en_o         (),
++      .io_halted        (io_halted),
++      .io_fault         (io_fault),
++      // DDR: clocked so the CDC logic is not left floating, but never ready
++      .ddr_clk_i        (clk),
++      .ddr_rst          (~rst_n),
++
++      .io_ddr_ctrl_axi_aw_valid    (ddr_ctrl_aw_valid),
++      .io_ddr_ctrl_axi_aw_ready    (1'b0),
++      .io_ddr_ctrl_axi_aw_bits_addr(),
++      .io_ddr_ctrl_axi_aw_bits_prot(),
++      .io_ddr_ctrl_axi_aw_bits_id  (),
++      .io_ddr_ctrl_axi_aw_bits_len (),
++      .io_ddr_ctrl_axi_aw_bits_size(),
++      .io_ddr_ctrl_axi_aw_bits_burst(),
++      .io_ddr_ctrl_axi_aw_bits_lock(),
++      .io_ddr_ctrl_axi_aw_bits_cache(),
++      .io_ddr_ctrl_axi_aw_bits_qos (),
++      .io_ddr_ctrl_axi_aw_bits_region(),
++      .io_ddr_ctrl_axi_w_valid     (ddr_ctrl_w_valid),
++      .io_ddr_ctrl_axi_w_ready     (1'b0),
++      .io_ddr_ctrl_axi_w_bits_data (),
++      .io_ddr_ctrl_axi_w_bits_last (),
++      .io_ddr_ctrl_axi_w_bits_strb (),
++      .io_ddr_ctrl_axi_b_valid     (1'b0),
++      .io_ddr_ctrl_axi_b_ready     (),
++      .io_ddr_ctrl_axi_b_bits_id   ('0),
++      .io_ddr_ctrl_axi_b_bits_resp ('0),
++      .io_ddr_ctrl_axi_ar_valid    (ddr_ctrl_ar_valid),
++      .io_ddr_ctrl_axi_ar_ready    (1'b0),
++      .io_ddr_ctrl_axi_ar_bits_addr(),
++      .io_ddr_ctrl_axi_ar_bits_prot(),
++      .io_ddr_ctrl_axi_ar_bits_id  (),
++      .io_ddr_ctrl_axi_ar_bits_len (),
++      .io_ddr_ctrl_axi_ar_bits_size(),
++      .io_ddr_ctrl_axi_ar_bits_burst(),
++      .io_ddr_ctrl_axi_ar_bits_lock(),
++      .io_ddr_ctrl_axi_ar_bits_cache(),
++      .io_ddr_ctrl_axi_ar_bits_qos (),
++      .io_ddr_ctrl_axi_ar_bits_region(),
++      .io_ddr_ctrl_axi_r_valid     (1'b0),
++      .io_ddr_ctrl_axi_r_ready     (),
++      .io_ddr_ctrl_axi_r_bits_data ('0),
++      .io_ddr_ctrl_axi_r_bits_id   ('0),
++      .io_ddr_ctrl_axi_r_bits_resp ('0),
++      .io_ddr_ctrl_axi_r_bits_last (1'b0),
++
++      .io_ddr_mem_axi_aw_valid     (ddr_mem_aw_valid),
++      .io_ddr_mem_axi_aw_ready     (1'b0),
++      .io_ddr_mem_axi_aw_bits_addr (),
++      .io_ddr_mem_axi_aw_bits_prot (),
++      .io_ddr_mem_axi_aw_bits_id   (),
++      .io_ddr_mem_axi_aw_bits_len  (),
++      .io_ddr_mem_axi_aw_bits_size (),
++      .io_ddr_mem_axi_aw_bits_burst(),
++      .io_ddr_mem_axi_aw_bits_lock (),
++      .io_ddr_mem_axi_aw_bits_cache(),
++      .io_ddr_mem_axi_aw_bits_qos  (),
++      .io_ddr_mem_axi_aw_bits_region(),
++      .io_ddr_mem_axi_w_valid      (ddr_mem_w_valid),
++      .io_ddr_mem_axi_w_ready      (1'b0),
++      .io_ddr_mem_axi_w_bits_data  (),
++      .io_ddr_mem_axi_w_bits_last  (),
++      .io_ddr_mem_axi_w_bits_strb  (),
++      .io_ddr_mem_axi_b_valid      (1'b0),
++      .io_ddr_mem_axi_b_ready      (),
++      .io_ddr_mem_axi_b_bits_id    ('0),
++      .io_ddr_mem_axi_b_bits_resp  ('0),
++      .io_ddr_mem_axi_ar_valid     (ddr_mem_ar_valid),
++      .io_ddr_mem_axi_ar_ready     (1'b0),
++      .io_ddr_mem_axi_ar_bits_addr (),
++      .io_ddr_mem_axi_ar_bits_prot (),
++      .io_ddr_mem_axi_ar_bits_id   (),
++      .io_ddr_mem_axi_ar_bits_len  (),
++      .io_ddr_mem_axi_ar_bits_size (),
++      .io_ddr_mem_axi_ar_bits_burst(),
++      .io_ddr_mem_axi_ar_bits_lock (),
++      .io_ddr_mem_axi_ar_bits_cache(),
++      .io_ddr_mem_axi_ar_bits_qos  (),
++      .io_ddr_mem_axi_ar_bits_region(),
++      .io_ddr_mem_axi_r_valid      (1'b0),
++      .io_ddr_mem_axi_r_ready      (),
++      .io_ddr_mem_axi_r_bits_data  ('0),
++      .io_ddr_mem_axi_r_bits_id    ('0),
++      .io_ddr_mem_axi_r_bits_resp  ('0),
++      .io_ddr_mem_axi_r_bits_last  (1'b0),
++
++      .io_dm_req_valid       (dm_req_valid),
++      .io_dm_req_ready       (dm_req_ready),
++      .io_dm_req_bits_address(dm_req.addr),
++      .io_dm_req_bits_data   (dm_req.data),
++      .io_dm_req_bits_op     (dm_req.op),
++      .io_dm_rsp_ready       (dm_rsp_ready),
++      .io_dm_rsp_valid       (dm_rsp_valid),
++      .io_dm_rsp_bits_data   (dm_rsp.data),
++      .io_dm_rsp_bits_op     (dm_rsp.resp)
++  );
++
++endmodule
+diff --git a/fpga/rtl/clkgen_vcu118.sv b/fpga/rtl/clkgen_vcu118.sv
+new file mode 100644
+index 0000000..1007c9b
+--- /dev/null
++++ b/fpga/rtl/clkgen_vcu118.sv
+@@ -0,0 +1,115 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Clock generator for the VCU118.
++//
++// Same outputs as clkgen_xilultrascaleplus (used by chip_nexus), but the
++// Nexus version hard-codes a 100 MHz input (VCO = 100 MHz x 12). The VCU118
++// 125 MHz LVDS system clock (SYSCLK_125, pins AY24/AY23) drives this one:
++//
++//   VCO      = 125 MHz x 8           = 1000 MHz  (MMCM VCO range 800..1600)
++//   clk_main = 1000 / (1000/MainMhz)              e.g. 50 MHz -> divide 20.0
++//   clk_spim = 1000 / 10            = 100 MHz
++//   clk_isp  = 1000 / 100           =  10 MHz
++module clkgen_vcu118 #(
++    parameter int ClockFrequencyMhz = 50
++) (
++    input  clk_p_i,
++    input  clk_n_i,
++    input  rst_ni,
++    output clk_main_o,
++    output clk_isp_o,
++    output clk_spim_o,
++    output rst_no,
++    output locked_o
++);
++  localparam real VcoMhz = 1000.0;
++  localparam real MainDivRaw = VcoMhz / ClockFrequencyMhz;
++  // Fractional dividers must be multiples of 0.125.
++  localparam real MainDiv = $rtoi(MainDivRaw * 8.0 + 0.5) / 8.0;
++
++  logic clk_in;
++  logic clk_fb_unbuf, clk_fb_buf;
++  logic clk_main_unbuf, clk_spim_unbuf, clk_isp_unbuf;
++  logic locked;
++
++  IBUFDS i_clk_ibufds (
++      .I (clk_p_i),
++      .IB(clk_n_i),
++      .O (clk_in)
++  );
++
++  MMCME2_ADV #(
++      .BANDWIDTH         ("OPTIMIZED"),
++      .COMPENSATION      ("ZHOLD"),
++      .STARTUP_WAIT      ("FALSE"),
++      .DIVCLK_DIVIDE     (1),
++      .CLKFBOUT_MULT_F   (8.000),
++      .CLKFBOUT_PHASE    (0.000),
++      .CLKOUT0_DIVIDE_F  (MainDiv),
++      .CLKOUT0_PHASE     (0.000),
++      .CLKOUT0_DUTY_CYCLE(0.500),
++      .CLKOUT2_DIVIDE    (10),
++      .CLKOUT2_PHASE     (0.000),
++      .CLKOUT2_DUTY_CYCLE(0.500),
++      .CLKOUT4_DIVIDE    (100),
++      .CLKOUT4_PHASE     (0.000),
++      .CLKOUT4_DUTY_CYCLE(0.500),
++      .CLKOUT4_CASCADE   ("FALSE"),
++      .CLKIN1_PERIOD     (8.000)
++  ) i_mmcm (
++      .CLKFBOUT    (clk_fb_unbuf),
++      .CLKFBOUTB   (),
++      .CLKOUT0     (clk_main_unbuf),
++      .CLKOUT0B    (),
++      .CLKOUT1     (),
++      .CLKOUT1B    (),
++      .CLKOUT2     (clk_spim_unbuf),
++      .CLKOUT2B    (),
++      .CLKOUT3     (),
++      .CLKOUT3B    (),
++      .CLKOUT4     (clk_isp_unbuf),
++      .CLKOUT5     (),
++      .CLKOUT6     (),
++      .CLKFBIN     (clk_fb_buf),
++      .CLKIN1      (clk_in),
++      .CLKIN2      (1'b0),
++      .CLKINSEL    (1'b1),
++      .DADDR       (7'h0),
++      .DCLK        (1'b0),
++      .DEN         (1'b0),
++      .DI          (16'h0),
++      .DO          (),
++      .DRDY        (),
++      .DWE         (1'b0),
++      .PSCLK       (1'b0),
++      .PSEN        (1'b0),
++      .PSINCDEC    (1'b0),
++      .PSDONE      (),
++      .CLKFBSTOPPED(),
++      .CLKINSTOPPED(),
++      .LOCKED      (locked),
++      .PWRDWN      (1'b0),
++      // Not reset by the push button, same as Nexus (keeps ILA/debug alive).
++      .RST         (1'b0)
++  );
++
++  BUFGCE i_fb_buf   (.I(clk_fb_unbuf),   .CE(1'b1), .O(clk_fb_buf));
++  BUFGCE i_main_buf (.I(clk_main_unbuf), .CE(1'b1), .O(clk_main_o));
++  BUFGCE i_spim_buf (.I(clk_spim_unbuf), .CE(1'b1), .O(clk_spim_o));
++  BUFGCE i_isp_buf  (.I(clk_isp_unbuf),  .CE(1'b1), .O(clk_isp_o));
++
++  assign rst_no   = locked & rst_ni;
++  assign locked_o = locked;
++endmodule
+diff --git a/fpga/rtl/dmi_bscane_tap.sv b/fpga/rtl/dmi_bscane_tap.sv
+new file mode 100644
+index 0000000..324c3e4
+--- /dev/null
++++ b/fpga/rtl/dmi_bscane_tap.sv
+@@ -0,0 +1,85 @@
++// Copyright 2020 ETH Zurich and University of Bologna.
++// Solderpad Hardware License, Version 0.51, see LICENSE for details.
++// SPDX-License-Identifier: SHL-0.51
++
++// VCU118 port: verbatim copy of hw/vendor/pulp_riscv_dbg/src/dmi_bscane_tap.sv
++// (lowRISC/opentitan @ 0e3cf622) with the module renamed from dmi_jtag_tap to
++// dmi_bscane_tap, so it can be compiled next to the pin-based dmi_jtag_tap
++// that the pulp-platform:riscv-dbg core already pulls in.
++
++// Author: Florian Zaruba <zarubaf@iis.ee.ethz.ch>
++
++/// Replacement for the full JTAG tap with `BSCANE2` Xilinx elements which hook
++/// into the FPGA native scan chain. Meant for FPGA boards which do not expose a
++/// usable pin-header or a separate, programmable FTDI chip.
++
++/// They replace the functionality of `dmi_jtag_tap.sv`. The file is
++/// pin-compatible so that by selecting the appropriate file for the target it
++/// can be transparently managed without relying on tick defines.
++module dmi_bscane_tap #(
++  // Ignored, defined by the FPGA model.
++  parameter int unsigned IrLength = 5,
++  // JTAG IDCODE Value
++  parameter logic [31:0] IdcodeValue = 32'h00000001
++  // xxxx             version
++  // xxxxxxxxxxxxxxxx part number
++  // xxxxxxxxxxx      manufacturer id
++  // 1                required by standard
++) (
++  /// Unused. Here to maintain pin compatibility with `dmi_jtag_tap` so that it
++  /// can be used as a drop-in replacement.
++  input  logic        tck_i,
++  input  logic        tms_i,
++  input  logic        trst_ni,
++  input  logic        td_i,
++  output logic        td_o,
++  output logic        tdo_oe_o,
++  input  logic        testmode_i,
++
++  output logic        tck_o,
++  output logic        dmi_clear_o,
++  output logic        update_o,
++  output logic        capture_o,
++  output logic        shift_o,
++  output logic        tdi_o,
++  output logic        dtmcs_select_o,
++  input  logic        dtmcs_tdo_i,
++  // we want to access DMI register
++  output logic        dmi_select_o,
++  input  logic        dmi_tdo_i
++);
++
++  BSCANE2 #(
++    .JTAG_CHAIN (3)
++  ) i_tap_dtmcs (
++    .CAPTURE (capture_o),
++    .DRCK (),
++    .RESET (dmi_clear_o),
++    .RUNTEST (),
++    .SEL (dtmcs_select_o),
++    .SHIFT (shift_o),
++    .TCK (tck_o),
++    .TDI (tdi_o),
++    .TMS (),
++    .TDO (dtmcs_tdo_i),
++    .UPDATE (update_o)
++  );
++
++  /// DMI Register
++  BSCANE2 #(
++    .JTAG_CHAIN (4)
++  ) i_tap_dmi (
++    .CAPTURE (),
++    .DRCK (),
++    .RESET (),
++    .RUNTEST (),
++    .SEL (dmi_select_o),
++    .SHIFT (),
++    .TCK (),
++    .TDI (),
++    .TMS (),
++    .TDO (dmi_tdo_i),
++    .UPDATE ()
++  );
++
++endmodule
+diff --git a/fpga/rtl/dmi_jtag_bscane.sv b/fpga/rtl/dmi_jtag_bscane.sv
+new file mode 100644
+index 0000000..e94fddb
+--- /dev/null
++++ b/fpga/rtl/dmi_jtag_bscane.sv
+@@ -0,0 +1,362 @@
++/* Copyright 2018 ETH Zurich and University of Bologna.
++* Copyright and related rights are licensed under the Solderpad Hardware
++* License, Version 0.51 (the “License”); you may not use this file except in
++* compliance with the License.  You may obtain a copy of the License at
++* http://solderpad.org/licenses/SHL-0.51. Unless required by applicable law
++* or agreed to in writing, software, hardware and materials distributed under
++* this License is distributed on an “AS IS” BASIS, WITHOUT WARRANTIES OR
++* CONDITIONS OF ANY KIND, either express or implied. See the License for the
++* specific language governing permissions and limitations under the License.
++*
++* File:   axi_riscv_debug_module.sv
++* Author: Florian Zaruba <zarubaf@iis.ee.ethz.ch>
++* Date:   19.7.2018
++*
++* Description: JTAG DMI (debug module interface)
++*
++*/
++
++// VCU118 port: verbatim copy of hw/vendor/pulp_riscv_dbg/src/dmi_jtag.sv
++// (lowRISC/opentitan @ 0e3cf622). Only two edits: the module is renamed to
++// dmi_jtag_bscane and it instantiates dmi_bscane_tap (BSCANE2 USER3/USER4)
++// instead of dmi_jtag_tap. The DMI protocol logic is unchanged.
++
++module dmi_jtag_bscane #(
++  parameter logic [31:0] IdcodeValue = 32'h00000DB3,
++  parameter int unsigned NumDmiWordAbits = 16 // Number of DMI address bits (7 - 32)
++) (
++  input  logic         clk_i,      // DMI Clock
++  input  logic         rst_ni,     // Asynchronous reset active low
++  input  logic         testmode_i,
++  input  logic         test_rst_ni,
++
++  // active-low glitch free reset signal. Is asserted
++  // (clk_i) whenever the dmi_jtag is reset.
++  output logic         dmi_rst_no,
++  output dm::dmi_req_t dmi_req_o,
++  output logic         dmi_req_valid_o,
++  input  logic         dmi_req_ready_i,
++
++  input dm::dmi_resp_t dmi_resp_i,
++  output logic         dmi_resp_ready_o,
++  input  logic         dmi_resp_valid_i,
++
++  input  logic         tck_i,    // JTAG test clock pad
++  input  logic         tms_i,    // JTAG test mode select pad
++  input  logic         trst_ni,  // JTAG test reset pad
++  input  logic         td_i,     // JTAG test data input pad
++  output logic         td_o,     // JTAG test data output pad
++  output logic         tdo_oe_o  // Data out output enable
++);
++
++  typedef enum logic [1:0] {
++    DMINoError = 2'h0, DMIReservedError = 2'h1,
++    DMIOPFailed = 2'h2, DMIBusy = 2'h3
++  } dmi_error_e;
++  dmi_error_e error_d, error_q;
++
++  logic tck;
++  logic jtag_dmi_clear; // Synchronous reset of DMI triggered by TestLogicReset in
++                        // jtag TAP
++  logic dmi_clear; // Functional (warm) reset of the entire DMI
++  logic update;
++  logic capture;
++  logic shift;
++  logic tdi;
++
++  logic dtmcs_select;
++  dm::dtmcs_t dtmcs_d, dtmcs_q;
++
++  assign dmi_clear = jtag_dmi_clear || (dtmcs_select && update && dtmcs_q.dmihardreset);
++
++  // -------------------------------
++  // Debug Module Control and Status
++  // -------------------------------
++
++  always_comb begin
++    dtmcs_d = dtmcs_q;
++    if (capture) begin
++      if (dtmcs_select) begin
++        dtmcs_d  = '{
++                      zero1        : '0,
++                      dmihardreset : 1'b0,
++                      dmireset     : 1'b0,
++                      zero0        : '0,
++                      idle         : 3'd1, // 1: Enter Run-Test/Idle and leave it immediately
++                      dmistat      : error_q, // 0: No error, 2: Op failed, 3: too fast
++                      abits        : 6'(NumDmiWordAbits), // The size of address in dmi
++                      version      : 4'd1  // Version described in spec version 0.13 (and later?)
++                    };
++      end
++    end
++
++    if (shift) begin
++      if (dtmcs_select) dtmcs_d  = {tdi, 31'(dtmcs_q >> 1)};
++    end
++  end
++
++  always_ff @(posedge tck or negedge trst_ni) begin
++    if (!trst_ni) begin
++      dtmcs_q <= '0;
++    end else begin
++      dtmcs_q <= dtmcs_d;
++    end
++  end
++
++  // ----------------------------
++  // DMI (Debug Module Interface)
++  // ----------------------------
++
++  logic        dmi_select;
++  logic        dmi_tdo;
++
++  dm::dmi_req_t  dmi_req;
++  logic          dmi_req_ready;
++  logic          dmi_req_valid;
++
++  dm::dmi_resp_t dmi_resp;
++  logic          dmi_resp_valid;
++  logic          dmi_resp_ready;
++
++  typedef struct packed {
++    logic [NumDmiWordAbits-1:0]  address;
++    logic [31:0] data;
++    logic [1:0]  op;
++  } dmi_t;
++
++  typedef enum logic [2:0] { Idle, Read, WaitReadValid, Write, WaitWriteValid } state_e;
++  state_e state_d, state_q;
++
++  logic [$bits(dmi_t)-1:0] dr_d, dr_q;
++  logic [NumDmiWordAbits-1:0] address_d, address_q;
++  logic [31:0] data_d, data_q;
++
++  dmi_t  dmi;
++  assign dmi          = dmi_t'(dr_q);
++  assign dmi_req.addr = $bits(dmi_req.addr)'(address_q);
++  assign dmi_req.data = data_q;
++  assign dmi_req.op   = (state_q == Write) ? dm::DTM_WRITE : dm::DTM_READ;
++  // We will always be ready to accept the data we requested.
++  assign dmi_resp_ready = 1'b1;
++
++  logic error_dmi_busy;
++  logic error_dmi_op_failed;
++
++  always_comb begin : p_fsm
++    error_dmi_busy = 1'b0;
++    error_dmi_op_failed = 1'b0;
++    // default assignments
++    state_d   = state_q;
++    address_d = address_q;
++    data_d    = data_q;
++    error_d   = error_q;
++
++    dmi_req_valid = 1'b0;
++
++    if (dmi_clear) begin
++      state_d   = Idle;
++      data_d    = '0;
++      error_d   = DMINoError;
++      address_d = '0;
++    end else begin
++      unique case (state_q)
++        Idle: begin
++          // make sure that no error is sticky
++          if (dmi_select && update && (error_q == DMINoError)) begin
++            // save address and value
++            address_d = dmi.address;
++            data_d = dmi.data;
++            if (dm::dtm_op_e'(dmi.op) == dm::DTM_READ) begin
++              state_d = Read;
++            end else if (dm::dtm_op_e'(dmi.op) == dm::DTM_WRITE) begin
++              state_d = Write;
++            end
++            // else this is a nop and we can stay here
++          end
++        end
++
++        Read: begin
++          dmi_req_valid = 1'b1;
++          if (dmi_req_ready) begin
++            state_d = WaitReadValid;
++          end
++        end
++
++        WaitReadValid: begin
++          // load data into register and shift out
++          if (dmi_resp_valid) begin
++            unique case (dmi_resp.resp)
++              dm::DTM_SUCCESS: begin
++                data_d = dmi_resp.data;
++              end
++              dm::DTM_ERR: begin
++                data_d = 32'hDEAD_BEEF;
++                error_dmi_op_failed = 1'b1;
++              end
++              dm::DTM_BUSY: begin
++                data_d = 32'hB051_B051;
++                error_dmi_busy = 1'b1;
++              end
++              default: begin
++                data_d = 32'hBAAD_C0DE;
++              end
++            endcase
++            state_d = Idle;
++          end
++        end
++
++        Write: begin
++          dmi_req_valid = 1'b1;
++          // request sent, wait for response before going back to idle
++          if (dmi_req_ready) begin
++            state_d = WaitWriteValid;
++          end
++        end
++
++        WaitWriteValid: begin
++          // got a valid answer go back to idle
++          if (dmi_resp_valid) begin
++            unique case (dmi_resp.resp)
++              dm::DTM_ERR: error_dmi_op_failed = 1'b1;
++              dm::DTM_BUSY: error_dmi_busy = 1'b1;
++              default: ;
++            endcase
++            state_d = Idle;
++          end
++        end
++
++        default: begin
++          // just wait for idle here
++          if (dmi_resp_valid) begin
++            state_d = Idle;
++          end
++        end
++      endcase
++
++      // update means we got another request but we didn't finish
++      // the one in progress, this state is sticky
++      if (update && state_q != Idle) begin
++        error_dmi_busy = 1'b1;
++      end
++
++      // if capture goes high while we are in the read state
++      // or in the corresponding wait state we are not giving back a valid word
++      // -> throw an error
++      if (capture && state_q inside {Read, WaitReadValid}) begin
++        error_dmi_busy = 1'b1;
++      end
++
++      if (error_dmi_busy && error_q == DMINoError) begin
++        error_d = DMIBusy;
++      end
++
++      if (error_dmi_op_failed && error_q == DMINoError) begin
++        error_d = DMIOPFailed;
++      end
++
++      // clear sticky error flag
++      if (update && dtmcs_q.dmireset && dtmcs_select) begin
++        error_d = DMINoError;
++      end
++    end
++  end
++
++  // shift register
++  assign dmi_tdo = dr_q[0];
++
++  always_comb begin : p_shift
++    dr_d    = dr_q;
++    if (dmi_clear) begin
++      dr_d = '0;
++    end else begin
++      if (capture) begin
++        if (dmi_select) begin
++          if (error_q == DMINoError && !error_dmi_busy) begin
++            dr_d = {address_q, data_q, DMINoError};
++            // DMI was busy, report an error
++          end else if (error_q == DMIBusy || error_dmi_busy) begin
++            dr_d = {address_q, data_q, DMIBusy};
++          end
++        end
++      end
++
++      if (shift) begin
++        if (dmi_select) begin
++          dr_d = {tdi, dr_q[$bits(dr_q)-1:1]};
++        end
++      end
++    end
++  end
++
++  always_ff @(posedge tck or negedge trst_ni) begin
++    if (!trst_ni) begin
++      dr_q      <= '0;
++      state_q   <= Idle;
++      address_q <= '0;
++      data_q    <= '0;
++      error_q   <= DMINoError;
++    end else begin
++      dr_q      <= dr_d;
++      state_q   <= state_d;
++      address_q <= address_d;
++      data_q    <= data_d;
++      error_q   <= error_d;
++    end
++  end
++
++  // ---------
++  // TAP
++  // ---------
++  dmi_bscane_tap #(
++    .IrLength (5),
++    .IdcodeValue(IdcodeValue)
++  ) i_dmi_jtag_tap (
++    .tck_i,
++    .tms_i,
++    .trst_ni,
++    .td_i,
++    .td_o,
++    .tdo_oe_o,
++    .testmode_i,
++    .tck_o          ( tck              ),
++    .dmi_clear_o    ( jtag_dmi_clear   ),
++    .update_o       ( update           ),
++    .capture_o      ( capture          ),
++    .shift_o        ( shift            ),
++    .tdi_o          ( tdi              ),
++    .dtmcs_select_o ( dtmcs_select     ),
++    .dtmcs_tdo_i    ( dtmcs_q[0]       ),
++    .dmi_select_o   ( dmi_select       ),
++    .dmi_tdo_i      ( dmi_tdo          )
++  );
++
++  // ---------
++  // CDC
++  // ---------
++  dmi_cdc i_dmi_cdc (
++    // Test controls
++    .testmode_i,
++    .test_rst_ni,
++    // JTAG side (master side)
++    .tck_i                ( tck              ),
++    .trst_ni              ( trst_ni          ),
++    .jtag_dmi_cdc_clear_i ( dmi_clear        ),
++    .jtag_dmi_req_i       ( dmi_req          ),
++    .jtag_dmi_ready_o     ( dmi_req_ready    ),
++    .jtag_dmi_valid_i     ( dmi_req_valid    ),
++    .jtag_dmi_resp_o      ( dmi_resp         ),
++    .jtag_dmi_valid_o     ( dmi_resp_valid   ),
++    .jtag_dmi_ready_i     ( dmi_resp_ready   ),
++    // core side
++    .clk_i,
++    .rst_ni,
++    .core_dmi_rst_no      ( dmi_rst_no       ),
++    .core_dmi_req_o       ( dmi_req_o        ),
++    .core_dmi_valid_o     ( dmi_req_valid_o  ),
++    .core_dmi_ready_i     ( dmi_req_ready_i  ),
++    .core_dmi_resp_i      ( dmi_resp_i       ),
++    .core_dmi_ready_o     ( dmi_resp_ready_o ),
++    .core_dmi_valid_i     ( dmi_resp_valid_i )
++  );
++
++endmodule : dmi_jtag_bscane
+diff --git a/fpga/sw/vcu118/hello.c b/fpga/sw/vcu118/hello.c
+new file mode 100644
+index 0000000..0a4b7af
+--- /dev/null
++++ b/fpga/sw/vcu118/hello.c
+@@ -0,0 +1,31 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// First program loaded through the JTAG debug port on the VCU118.
++
++#include <stdint.h>
++
++#include "fpga/sw/uart.h"
++
++int main(void) {
++  uart_init();
++  uart_puts("Hello from CoralNPU on VCU118 (loaded over JTAG)\r\n");
++  for (uint32_t i = 0; i < 5; ++i) {
++    uart_puts("  count = ");
++    uart_puthex32(i);
++    uart_puts("\r\n");
++  }
++  uart_puts("DONE\r\n");
++  return 0;
++}
+diff --git a/fpga/sw/vcu118/rom_park.c b/fpga/sw/vcu118/rom_park.c
+new file mode 100644
+index 0000000..8e63996
+--- /dev/null
++++ b/fpga/sw/vcu118/rom_park.c
+@@ -0,0 +1,54 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// VCU118 boot ROM: say hello on the console, then park.
++//
++// The VCU118 has no SPI-flash loader wired up, so this ROM does not try to
++// boot anything. It proves that clock, reset, the core and UART1 work, and
++// then spins in a tight loop that the debugger can halt. After halting,
++// OpenOCD/GDB loads a program into ITCM/DTCM and resumes at its entry point.
++
++#include <stdint.h>
++
++#include "fpga/sw/clk.h"
++#include "fpga/sw/gpio.h"
++#include "fpga/sw/uart.h"
++
++static void uart_putdec(uint32_t v) {
++  char buf[11];
++  int n = 0;
++  do {
++    buf[n++] = (char)('0' + v % 10);
++    v /= 10;
++  } while (v != 0);
++  while (n > 0) uart_putc(buf[--n]);
++}
++
++int main(void) {
++  uart_init();
++  uart_puts("\r\nCoralNPU on VCU118: ROM alive, main clock ");
++  uart_putdec(clk_get_main_freq_mhz());
++  uart_puts(" MHz\r\nParked. Attach the debugger (OpenOCD) to load a program.\r\n");
++
++  // Walk a bit across LED[7:4] so "core is executing" is visible on the board.
++  gpio_set_output_enable(0xF);
++  uint32_t pattern = 1;
++  while (1) {
++    gpio_write(pattern);
++    pattern = (pattern << 1) & 0xF;
++    if (pattern == 0) pattern = 1;
++    for (volatile uint32_t i = 0; i < 2000000; ++i) {
++    }
++  }
++}
+diff --git a/fpga/vcu118/README.md b/fpga/vcu118/README.md
+new file mode 100644
+index 0000000..6e202d8
+--- /dev/null
++++ b/fpga/vcu118/README.md
+@@ -0,0 +1,63 @@
++# CoralNPU on VCU118
++
++`chip_nexus`(Google 사내 보드, xcvu13p)를 VCU118(xcvu9p-flga2104-2L-e)로 옮긴 것.
++프로그램 적재와 디버그는 **FPGA 자체 JTAG(BSCANE2)** 로 한다. 추가 케이블 없음.
++
++## 무엇이 들어 있나
++
++| 파일 | 역할 |
++|---|---|
++| `rtl/chip_vcu118.sv` | 탑. 125 MHz 클럭, CPU_RESET, UART1 → USB-UART, LED 8개, DDR 미연결 |
++| `rtl/clkgen_vcu118.sv` | 125 MHz → VCO 1000 MHz → main 50 / SPIM 100 / ISP 10 MHz |
++| `rtl/dmi_jtag_bscane.sv`, `rtl/dmi_bscane_tap.sv` | pulp riscv-dbg 의 BSCANE2 판 DTM (모듈 이름만 바꾼 사본) |
++| `pins_vcu118.xdc` | 핀. AMD 보드 파일(XilinxBoardStore vcu118/2.4) 값과 대조 완료 |
++| `chip_vcu118.core` | FuseSoC 코어 (part = xcvu9p-flga2104-2L-e) |
++| `vcu118_setup_hooks.tcl`, `vcu118_pre_opt_hooks.tcl` | Nexus 훅에서 pblock·SLR3 지정을 뺀 것 (VU9P 는 SLR0~2 뿐) |
++| `sw/vcu118/rom_park.c` | 부트 ROM: UART 배너 출력 후 대기 (디버거가 멈추고 프로그램을 올림) |
++| `sw/vcu118/hello.c` | JTAG 으로 올리는 첫 프로그램 |
++| `vcu118/gen_openocd_cfg.sh` | Vivado 의 BSDL 에서 IR 길이·USER3/USER4 코드를 읽어 OpenOCD 설정 생성 |
++| `vcu118/load_elf.sh` | ELF 를 ITCM/DTCM 에 올리고 실행 |
++
++LED: `[0]` MMCM lock · `[1]` 하트비트(클럭만 있으면 깜빡임) · `[2]` halted · `[3]` fault ·
++`[7:4]` ROM 이 돌리는 GPIO 패턴(코어가 명령을 실행 중이라는 뜻).
++
++## 빌드 (Linux, Vivado 가 PATH 에 있어야 함)
++
++```bash
++source /tools/Xilinx/Vivado/2026.1/settings64.sh   # 설치 경로에 맞게
++bazel build //fpga:build_chip_vcu118_synth_only_vector_normal   # 합성만 → LUT 확인
++bazel build //fpga:build_chip_vcu118_bitstream_vector_normal    # 비트스트림
++bazel build //fpga:vcu118_hello                                 # 첫 ELF
++```
++
++`vector_highmem`(ITCM/DTCM 각 1 MB) 판도 같은 이름 규칙으로 있다. DDR 이 없으므로
++큰 프로그램은 highmem 판을 쓴다.
++
++## 보드에서
++
++1. USB 두 개: **J106**(JTAG, Digilent JTAG-SMT2-NC) 과 **J4**(UART, CP2105).
++2. UART 터미널 115200 8N1. CP2105 는 포트가 두 개 생긴다 — 배너가 나오는 쪽이 FPGA 쪽.
++3. Vivado Hardware Manager 로 `.bit` 다운로드. 즉시 UART 에:
++   ```
++   CoralNPU on VCU118: ROM alive, main clock 50 MHz
++   Parked. Attach the debugger (OpenOCD) to load a program.
++   ```
++4. **Hardware Manager 를 닫는다** (hw_server 와 OpenOCD 는 USB-JTAG 을 동시에 못 쓴다).
++5. ```bash
++   fpga/vcu118/gen_openocd_cfg.sh > openocd_vcu118.cfg     # 한 번만
++   fpga/vcu118/load_elf.sh openocd_vcu118.cfg bazel-bin/fpga/vcu118_hello.elf
++   ```
++   UART 에 `Hello from CoralNPU on VCU118 (loaded over JTAG)` … `DONE`.
++
++GDB 로 붙으려면 `openocd -f openocd_vcu118.cfg` 를 띄워 두고 `target extended-remote :3333`.
++
++## 알려진 한계
++
++- **DDR4 없음.** `0x8000_0000` 이상을 건드리면 버스가 멈춘다(상류 ddr4_stub 과 같은 동작).
++  CPU_RESET 버튼으로 풀린다.
++- SPI 로더·SPI 플래시·I2C·카메라 미연결.
++- `gen_openocd_cfg.sh` 의 BSDL 파서는 Xilinx BSDL 형식을 가정한다. 파싱 실패 시 멈추고
++  이유를 출력한다 — 값을 짐작해서 넣지 말 것 (공개 표에 VU9P IR 길이가 24 로 적힌 곳이
++  있으나 VU9P 는 3-SLR 이므로 18 이 맞을 가능성이 높다. BSDL 이 정답).
++- 아직 실제 Vivado 합성·보드 실행 전이다. 검증된 것은 Verilator lint, 핀 대조,
++  MMCM 분주 계산, OpenOCD 설정 파싱까지.
+diff --git a/fpga/vcu118/gen_openocd_cfg.sh b/fpga/vcu118/gen_openocd_cfg.sh
+new file mode 100755
+index 0000000..5a27b5b
+--- /dev/null
++++ b/fpga/vcu118/gen_openocd_cfg.sh
+@@ -0,0 +1,80 @@
++#!/usr/bin/env bash
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# Generate the OpenOCD config for chip_vcu118 from the XCVU9P BSDL file that
++# ships with Vivado.
++#
++# Why generate instead of hard-coding: the debug transport sits behind the
++# FPGA's BSCANE2 USER3 (DTMCS) / USER4 (DMI) instructions. On stacked-silicon
++# parts (VU9P = 3 SLRs) the instruction register is the concatenation of every
++# SLR's IR, so the USER3/USER4 opcodes are long and part-specific. Published
++# tables disagree on the VU9P values, so we read them from AMD's own BSDL.
++#
++# Usage: gen_openocd_cfg.sh [path/to/xcvu9p*.bsd] > openocd_vcu118.cfg
++set -euo pipefail
++
++BSD="${1:-}"
++if [[ -z "${BSD}" ]]; then
++  : "${XILINX_VIVADO:?set XILINX_VIVADO (source settings64.sh) or pass the .bsd path}"
++  BSD="$(find "${XILINX_VIVADO}/data/parts" -iname 'xcvu9p*flga2104*.bsd' 2>/dev/null | head -n1)"
++fi
++[[ -f "${BSD}" ]] || { echo "BSDL file not found: '${BSD}'" >&2; exit 1; }
++
++irlen="$(grep -iE 'attribute[[:space:]]+INSTRUCTION_LENGTH' "${BSD}" | grep -oE '[0-9]+' | tail -n1)"
++# Opcode lines look like:  "USER3  (100010100100100100)," & -- possibly with X's
++opcode() {
++  local name="$1"
++  grep -iE "\"?[[:space:]]*${name}[[:space:]]*\(" "${BSD}" | head -n1 |
++    sed -E "s/.*${name}[[:space:]]*\(([01Xx, ]+)\).*/\1/I" | cut -d, -f1 | tr -d ' ' | tr 'Xx' '00'
++}
++user3="$(opcode USER3)"
++user4="$(opcode USER4)"
++idcode="$(opcode IDCODE)"
++for v in irlen user3 user4 idcode; do
++  [[ -n "${!v}" ]] || { echo "could not parse ${v} from ${BSD}" >&2; exit 1; }
++done
++if [[ "${#user3}" -ne "${irlen}" ]]; then
++  echo "opcode width ${#user3} != INSTRUCTION_LENGTH ${irlen}; check ${BSD}" >&2
++  exit 1
++fi
++hex() { printf '0x%x' "$((2#$1))"; }
++
++cat <<CFG
++# Generated by fpga/vcu118/gen_openocd_cfg.sh from:
++#   $(basename "${BSD}")
++# IR length ${irlen}, USER3=${user3}, USER4=${user4}
++
++adapter speed 10000
++source [find interface/ftdi/digilent_jtag_smt2_nc.cfg]
++transport select jtag
++
++set _CHIPNAME vu9p
++jtag newtap \$_CHIPNAME tap -irlen ${irlen}
++
++set _TARGETNAME \$_CHIPNAME.cpu
++target create \$_TARGETNAME riscv -chain-position \$_CHIPNAME.tap
++
++# The RISC-V DTM lives behind BSCANE2 USER3 (dtmcs) and USER4 (dmi).
++riscv set_ir idcode $(hex "${idcode}")
++riscv set_ir dtmcs  $(hex "${user3}")
++riscv set_ir dmi    $(hex "${user4}")
++
++# Same memory access mode as the upstream Verilator setup (jtag-sim.cfg).
++riscv set_mem_access abstract
++gdb_breakpoint_override hard
++
++init
++halt
++CFG
+diff --git a/fpga/vcu118/load_elf.sh b/fpga/vcu118/load_elf.sh
+new file mode 100755
+index 0000000..37ef7cb
+--- /dev/null
++++ b/fpga/vcu118/load_elf.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# Load an ELF into the running chip_vcu118 over JTAG and start it.
++#   load_elf.sh openocd_vcu118.cfg path/to/program.elf
++# The park ROM must be running (banner on the UART). Vivado Hardware Manager
++# must be closed first: OpenOCD and hw_server cannot share the USB-JTAG.
++set -euo pipefail
++cfg="$1"; elf="$2"
++entry="$(readelf -h "${elf}" | awk '/Entry point address/ {print $4}')"
++exec openocd -f "${cfg}" \
++  -c "load_image ${elf}" \
++  -c "verify_image ${elf}" \
++  -c "resume ${entry}" \
++  -c "shutdown"
+diff --git a/fpga/vcu118_pre_opt_hooks.tcl b/fpga/vcu118_pre_opt_hooks.tcl
+new file mode 100644
+index 0000000..1f447af
+--- /dev/null
++++ b/fpga/vcu118_pre_opt_hooks.tcl
+@@ -0,0 +1,37 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++# Pre-opt hook for chip_vcu118.
++#
++# The Nexus hook (vivado_pre_opt_hooks.tcl) cannot be reused as-is:
++#   * it sources pblock_u_isp.tcl / pblock_u_ddr.tcl, which place the camera
++#     ISP and the DDR4 MIG at Nexus-specific sites (no MIG in this build);
++#   * it pins the TCMs to SLR3. The VU13P has 4 SLRs, the VU9P only 3
++#     (SLR0..SLR2), so SLR3 does not exist here.
++# Everything else is the same generic tuning.
++
++set script_dir [file dirname [file normalize [info script]]]
++source "${script_dir}/check_pin_assignments.tcl"
++
++catch {
++    set sram_cells [get_cells -quiet -hierarchical -filter {PRIMITIVE_SUBGROUP == ram && (NAME =~ *SRAM* || NAME =~ *sram* || NAME =~ *tcm*)}]
++    if {[llength $sram_cells] > 0} {
++        set_property RAM_STYLE ultra $sram_cells
++        puts "INFO: Enforced RAM_STYLE ultra on [llength $sram_cells] SRAM cells."
++    }
++}
++
++catch { set_property MUXF_REMAP 1 [get_cells -hierarchical -filter {REF_NAME =~ MUXF* && NAME =~ *score/lsu*}] }
++catch { set_property MAX_FANOUT 256 [get_cells -hierarchical -filter {NAME =~ *score/lsu/rs/deqPtr_reg*}] }
++catch { set_property MAX_FANOUT 256 [get_cells -hierarchical -filter {NAME =~ *div_clk_rst_r1_reg*}] }
+diff --git a/fpga/vcu118_setup_hooks.tcl b/fpga/vcu118_setup_hooks.tcl
+new file mode 100644
+index 0000000..b365ad4
+--- /dev/null
++++ b/fpga/vcu118_setup_hooks.tcl
+@@ -0,0 +1,74 @@
++# Copyright 2025 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++## Elevate warning for not finding file for readmemh to ERROR.
++set_msg_config -id {[Synth 8-4445]} -new_severity ERROR
++
++set workroot [pwd]
++
++# Fix up MemInitFile path if it's relative to the execroot but we are in a subdirectory
++# This is common in Bazel builds where FuseSoC runs in a subdirectory of the sandbox.
++set generics [get_property generic [get_filesets sources_1]]
++set new_generics [list]
++set changed 0
++foreach g $generics {
++    if {[regexp {MemInitFile=\"?([^\"]*)\"?} $g match val]} {
++        if {$val != "" && ![file exists $val]} {
++            # Search for the file in parent directories (up to 10 levels)
++            set search_root $workroot
++            set found 0
++            for {set i 0} {$i < 10} {incr i} {
++                set search_root [file dirname $search_root]
++                if {[file exists [file join $search_root $val]]} {
++                    set val [file normalize [file join $search_root $val]]
++                    set found 1
++                    break
++                }
++            }
++            if {$found} {
++                set changed 1
++            }
++        }
++        # Re-quote the value for the generic property
++        lappend new_generics "MemInitFile=\"$val\""
++    } else {
++        lappend new_generics $g
++    }
++}
++if {$changed} {
++    set_property generic $new_generics [get_filesets sources_1]
++}
++
++# Register optimization, placement quality gate, and post-route assessment hooks
++set_property STEPS.OPT_DESIGN.TCL.PRE "${workroot}/vcu118_pre_opt_hooks.tcl" [get_runs impl_1]
++set_property STEPS.PLACE_DESIGN.TCL.POST "${workroot}/vivado_post_place_hooks.tcl" [get_runs impl_1]
++set_property STEPS.ROUTE_DESIGN.TCL.POST "${workroot}/vivado_post_route_hooks.tcl" [get_runs impl_1]
++
++# Implementation directives for placement, phys_opt, and route (UG949)
++set_property -name {STEPS.OPT_DESIGN.ARGS.MORE OPTIONS} -value {-muxf_remap} -objects [get_runs impl_1]
++set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE SSI_BalanceSLRs [get_runs impl_1]
++set_property STEPS.PHYS_OPT_DESIGN.ARGS.DIRECTIVE ExploreWithAggressiveHoldFix [get_runs impl_1]
++set_property STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE MoreGlobalIterations [get_runs impl_1]
++
++# Enable post-route physical optimization to clean up any remaining hold slack
++set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
++set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.ARGS.DIRECTIVE Explore [get_runs impl_1]
++
++set_param place.sliceLegEffortLimit 2000
++set_param route.enableGlobalHoldIter 1
++
++# If we see the Xilinx DDR core, register the post-bitstream hook to stitch the calibration FW.
++if {[file exists "${workroot}/src/xilinx_ddr4_0_0.1_0"]} {
++    set_property STEPS.WRITE_BITSTREAM.TCL.POST "${workroot}/vivado_hook_write_bitstream_post.tcl" [get_runs impl_1]
++}

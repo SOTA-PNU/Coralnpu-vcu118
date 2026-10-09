@@ -1,0 +1,6 @@
+# Let non-root users open the VCU118 USB devices (OpenOCD, serial console).
+# Install:  sudo cp udev/60-vcu118.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+# Digilent JTAG-SMT2-NC (FT232H) on J106
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", MODE="0666"
+# Silicon Labs CP2105 dual USB-UART on J4
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea70", MODE="0666"

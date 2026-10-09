@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# CoralNPU on VCU118 — one entry point for everything.
+#
+#   ./coral doctor            check tools, cable and serial port
+#   ./coral setup             fetch upstream CoralNPU (pinned) and apply patches/
+#   ./coral build             bitstream + boot ROM + hello.elf -> out/
+#   ./coral program [x.bit]   load the bitstream (Vivado batch)
+#   ./coral load <x.elf>      load and run a program over JTAG (OpenOCD)
+#   ./coral console           open the USB-UART console
+#   ./coral up [x.bit]        program + wait for the ROM banner + run hello.elf
+#
+# Environment overrides: CONFIG, HW_SERVER, UART_DEV (see config.sh).
+set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/config.sh"
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+
+bazel_cmd() {
+  if command -v bazelisk >/dev/null; then echo bazelisk; return; fi
+  if command -v bazel >/dev/null; then echo bazel; return; fi
+  local b="${TOOLS}/bazelisk"
+  if [[ ! -x "${b}" ]]; then
+    mkdir -p "${TOOLS}"
+    info "downloading bazelisk to tools/"
+    curl -fsSL -o "${b}" \
+      https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-linux-amd64
+    chmod +x "${b}"
+  fi
+  echo "${b}"
+}
+
+need_vivado() {
+  command -v vivado >/dev/null ||
+    die "vivado not on PATH. Run: source <Vivado install>/2026.1/Vivado/settings64.sh"
+}
+
+find_uart() {
+  if [[ -n "${UART_DEV}" ]]; then echo "${UART_DEV}"; return; fi
+  # CP2105 enumerates as two ttyUSB ports; by-id names contain "CP2105".
+  local d
+  for d in /dev/serial/by-id/*CP2105*; do
+    [[ -e "${d}" ]] && { readlink -f "${d}"; return; }
+  done
+  find /dev -maxdepth 1 -name "ttyUSB*" 2>/dev/null | sort | head -n1
+}
+
+# ---------------------------------------------------------------------------
+cmd_doctor() {
+  local ok=1
+  check() { if eval "$2" >/dev/null 2>&1; then echo "  [ok]   $1"; else echo "  [miss] $1  -> $3"; ok=0; fi; }
+  echo "tools:"
+  check git            "command -v git"      "sudo apt install git"
+  check curl           "command -v curl"     "sudo apt install curl"
+  check readelf        "command -v readelf"  "sudo apt install binutils"
+  check openocd        "command -v openocd"  "sudo apt install openocd"
+  check vivado         "command -v vivado"   "source .../Vivado/settings64.sh"
+  check "bazel(isk)"   "bazel_cmd"           "downloaded automatically on first build"
+  echo "board:"
+  check "USB-JTAG 0403:6014 (Digilent JTAG-SMT2-NC, J106)" "lsusb -d 0403:6014" \
+        "cable on J106? VirtualBox: Devices > USB > Digilent"
+  check "USB-UART CP2105 (J4)" "[[ -n \"\$(find_uart)\" ]]" \
+        "cable on J4? VirtualBox: Devices > USB > Silicon Labs CP2105"
+  echo "upstream:"
+  check "work/coralnpu at ${CORALNPU_COMMIT:0:8} with patches" \
+        "[[ -f '${WORK}/fpga/rtl/chip_vcu118.sv' ]]" "./coral setup"
+  [[ ${ok} == 1 ]] && echo "all good" || echo "fix the [miss] lines above"
+}
+
+# ---------------------------------------------------------------------------
+cmd_setup() {
+  if [[ ! -d "${WORK}/.git" ]]; then
+    info "cloning upstream CoralNPU"
+    mkdir -p "$(dirname "${WORK}")"
+    git clone --filter=blob:none "${CORALNPU_URL}" "${WORK}"
+  fi
+  cd "${WORK}"
+  local head
+  head="$(git rev-parse HEAD)"
+  if [[ "${head}" != "${CORALNPU_COMMIT}" ]]; then
+    if [[ -n "$(git status --porcelain)" ]]; then
+      die "work/coralnpu has local changes; move them away or delete work/ and rerun"
+    fi
+    git fetch -q origin "${CORALNPU_COMMIT}" 2>/dev/null || git fetch -q origin
+    git checkout -q --detach "${CORALNPU_COMMIT}"
+  fi
+  local p
+  for p in "${ROOT}"/patches/*.patch; do
+    [[ -e "${p}" ]] || continue
+    if git apply --reverse --check "${p}" 2>/dev/null; then
+      echo "  already applied: $(basename "${p}")"
+    else
+      git apply --check "${p}" || die "patch does not apply: $(basename "${p}")"
+      git apply "${p}"
+      echo "  applied:         $(basename "${p}")"
+    fi
+  done
+  info "upstream ready at ${WORK} (${CORALNPU_COMMIT:0:8})"
+}
+
+# ---------------------------------------------------------------------------
+bazel_files() {  # print output files of a target
+  "$(bazel_cmd)" cquery --output=files "$1" 2>/dev/null
+}
+
+cmd_build() {
+  need_vivado
+  [[ -f "${WORK}/fpga/rtl/chip_vcu118.sv" ]] || cmd_setup
+  local bz bit_target
+  bz="$(bazel_cmd)"
+  bit_target="//fpga:build_chip_vcu118_bitstream_${CONFIG}"
+  cd "${WORK}"
+  info "building ${bit_target} (Vivado synthesis + P&R: expect an hour or more)"
+  "${bz}" build "${bit_target}" //fpga:vcu118_hello.elf
+
+  mkdir -p "${OUT}"
+  local dir bit elf
+  dir="$(bazel_files "${bit_target}" | head -n1)"
+  # FuseSoC names the bitstream after the core (com.google.coralnpu_fpga_chip_vcu118_0.1.bit)
+  bit="$(find "${WORK}/${dir}" -name '*.bit' | head -n1)"
+  [[ -n "${bit}" ]] || die "no .bit under ${dir}"
+  cp -f "${bit}" "${OUT}/chip_vcu118_${CONFIG}.bit"
+  find "${WORK}/${dir}" -name '*utilization*.rpt' -exec cp -f {} "${OUT}/" \; 2>/dev/null || true
+  find "${WORK}/${dir}" -name '*timing*.rpt' -exec cp -f {} "${OUT}/" \; 2>/dev/null || true
+
+  elf="$(bazel_files //fpga:vcu118_hello.elf | head -n1)"
+  cp -f "${WORK}/${elf}" "${OUT}/vcu118_hello.elf"
+
+  "${WORK}/fpga/vcu118/gen_openocd_cfg.sh" > "${OUT}/openocd_vcu118.cfg"
+  info "outputs:"; ls -la "${OUT}"
+}
+
+# ---------------------------------------------------------------------------
+cmd_program() {
+  need_vivado
+  local bit="${1:-${OUT}/chip_vcu118_${CONFIG}.bit}"
+  [[ -f "${bit}" ]] || die "bitstream not found: ${bit} (run ./coral build)"
+  info "programming ${bit} via hw_server ${HW_SERVER}"
+  (cd "${OUT}" && vivado -mode batch -nojournal -nolog -notrace \
+      -source "${ROOT}/vivado/program.tcl" -tclargs "${bit}" "${HW_SERVER}")
+  # A local hw_server keeps the USB-JTAG open; OpenOCD needs it free.
+  if [[ "${HW_SERVER}" == localhost:* ]]; then pkill -x hw_server 2>/dev/null || true; fi
+}
+
+# ---------------------------------------------------------------------------
+openocd_cfg() {
+  local cfg="${OUT}/openocd_vcu118.cfg"
+  if [[ ! -f "${cfg}" ]]; then
+    need_vivado   # the generator reads the BSDL shipped with Vivado
+    mkdir -p "${OUT}"
+    "${WORK}/fpga/vcu118/gen_openocd_cfg.sh" > "${cfg}"
+  fi
+  echo "${cfg}"
+}
+
+cmd_load() {
+  local elf="${1:-}"
+  [[ -f "${elf}" ]] || die "usage: ./coral load <program.elf>"
+  pgrep -x hw_server >/dev/null &&
+    die "hw_server is running and holds the JTAG cable. Close Vivado Hardware Manager / pkill hw_server"
+  local cfg entry
+  cfg="$(openocd_cfg)"
+  entry="$(readelf -h "${elf}" | awk '/Entry point address/ {print $4}')"
+  info "loading ${elf} (entry ${entry})"
+  openocd -f "${cfg}" \
+    -c "load_image ${elf}" \
+    -c "verify_image ${elf}" \
+    -c "resume ${entry}" \
+    -c "shutdown"
+}
+
+# ---------------------------------------------------------------------------
+uart_setup() {
+  stty -F "$1" "${UART_BAUD}" cs8 -cstopb -parenb raw -echo
+}
+
+cmd_console() {
+  local dev; dev="$(find_uart)"
+  [[ -n "${dev}" ]] || die "no USB-UART found (cable on J4?)"
+  info "console on ${dev} @ ${UART_BAUD} (Ctrl-A Ctrl-X to quit picocom, Ctrl-C otherwise)"
+  if command -v picocom >/dev/null; then exec picocom -b "${UART_BAUD}" "${dev}"; fi
+  uart_setup "${dev}"; exec cat "${dev}"
+}
+
+# ---------------------------------------------------------------------------
+cmd_up() {
+  local dev log=""
+  dev="$(find_uart)"
+  if [[ -n "${dev}" ]]; then
+    uart_setup "${dev}"
+    log="$(mktemp)"
+    cat "${dev}" > "${log}" &
+    UART_CAT_PID=$!   # global: the EXIT trap runs after this function returns
+    trap 'kill "${UART_CAT_PID:-}" 2>/dev/null || true' EXIT
+  else
+    echo "WARN: no USB-UART found; skipping the banner check"
+  fi
+
+  cmd_program "$@"
+
+  if [[ -n "${log}" ]]; then
+    info "waiting for the boot ROM banner"
+    for _ in $(seq 1 50); do
+      grep -q "ROM alive" "${log}" && break
+      sleep 0.2
+    done
+    if grep -q "ROM alive" "${log}"; then
+      sed 's/\r//' "${log}"
+    else
+      cat "${log}"
+      die "no banner on ${dev}. Wrong CP2105 port? try UART_DEV=/dev/ttyUSB1 ./coral up"
+    fi
+  fi
+
+  cmd_load "${OUT}/vcu118_hello.elf"
+
+  if [[ -n "${log}" ]]; then
+    sleep 1
+    info "console output:"
+    sed 's/\r//' "${log}"
+    if grep -q "DONE" "${log}"; then
+      info "CoralNPU is up."
+    else
+      die "hello.elf did not print DONE"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+sub="${1:-}"; shift || true
+case "${sub}" in
+  doctor|setup|build|program|load|console|up) "cmd_${sub}" "$@" ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

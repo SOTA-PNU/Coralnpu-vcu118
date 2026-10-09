@@ -1,0 +1,7 @@
+# upstream checkout, build outputs, downloaded tools
+/work/
+/out/
+/tools/
+*.jou
+*.log
+.Xil/
