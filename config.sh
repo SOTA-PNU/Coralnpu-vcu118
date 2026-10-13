@@ -21,4 +21,4 @@ UART_BAUD=115200
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="${ROOT}/work/coralnpu"
 OUT="${ROOT}/out"
-TOOLS="${ROOT}/tools"
+TOOLS="${ROOT}/.tools"   # downloaded helpers (bazelisk); tools/ holds our scripts

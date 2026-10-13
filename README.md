@@ -12,7 +12,7 @@ patches/        상류에 얹는 패치. 번호 순서대로 적용
 coral           모든 작업의 입구 (아래)
 vivado/         비트스트림 다운로드 Tcl
 udev/           USB 권한 규칙
-work/  out/     (git 제외) 상류 체크아웃 / 산출물
+work/ out/ .tools/  (git 제외) 상류 체크아웃 / 산출물 / 내려받은 도구
 ```
 
 ## 보드를 연결한 뒤
@@ -32,15 +32,26 @@ work/  out/     (git 제외) 상류 체크아웃 / 산출물
 
 내 프로그램을 돌릴 때는 `./coral load my_program.elf`, 콘솔만 볼 때는 `./coral console`.
 
-## 처음 한 번 (빌드 머신)
+## 처음 한 번
 
+두 PC 구성이다: **빌드 VM**(Vivado, `coral`) 과 **보드 PC**(VCU118 USB 가 꽂힌 서버).
+
+| 스크립트 | 어디서 | 하는 일 |
+|---|---|---|
+| `tools/create-vcu118-vm.ps1` | Windows (내 PC) | Ubuntu 22.04.5 VM 생성, MAC 고정(라이선스 Host ID), 무인 설치 |
+| `tools/vm-setup.sh` | VM 안 | 패키지, Vivado 2026.1 (Virtex UltraScale+ 만), 라이선스 안내, `coral setup` |
+| `tools/board-host.ps1` | 보드 PC (Windows) | hw_server 실행 + CP2105 COM 포트 → TCP 5000/5001 중계 |
+
+```powershell
+# 내 PC (PowerShell 5.1)
+powershell -ExecutionPolicy Bypass -File tools\create-vcu118-vm.ps1
+```
 ```bash
-source /tools/Xilinx/2026.1/Vivado/settings64.sh   # 설치 경로에 맞게
-sudo apt install git curl binutils openocd picocom
-sudo cp udev/60-vcu118.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
-
-./coral setup      # 상류를 work/coralnpu 에 받고 patches/ 적용 (Bazel 은 9.1.0, 자동 설치)
-./coral build      # 비트스트림 + hello.elf + OpenOCD 설정 → out/   (Vivado P&R, 1시간+)
+# VM 안
+git clone https://github.com/SOTA-PNU/Coralnpu-vcu118.git && cd Coralnpu-vcu118
+./tools/vm-setup.sh          # 멈춘 곳의 안내를 따르고 다시 실행
+./tools/vm-setup.sh license ~/Downloads/Xilinx.lic
+./coral build                # 비트스트림 + hello.elf + 설정 → out/   (Vivado P&R, 1시간+)
 ```
 
 `CONFIG=vector_highmem ./coral build` 로 ITCM/DTCM 각 1 MB 판을 만든다 (DDR 이 아직 없으므로
@@ -56,13 +67,12 @@ sudo cp udev/60-vcu118.rules /etc/udev/rules.d/ && sudo udevadm control --reload
 
 LED: `0` 클럭 lock · `1` 하트비트 · `2` halted · `3` fault · `7:4` ROM 이 돌리는 패턴.
 
-### VirtualBox 에서 쓸 때
+### 보드가 다른 PC 에 꽂혀 있을 때 (현재 구성)
 
-OpenOCD 는 USB-JTAG 을 **직접** 잡는다. VM 메뉴 *Devices → USB* 에서 Digilent 와
-CP2105 두 장치를 VM 에 붙여야 `./coral up` 이 끝까지 간다 (`./coral doctor` 로 확인).
-비트스트림만 올릴 거라면 Windows 호스트의 hw_server 를 써도 된다:
-`HW_SERVER=10.0.2.2:3121 ./coral program` — 단 이 경우 USB 가 호스트에 있으므로
-`load`/`up` 은 동작하지 않는다.
+보드 PC 에서 `tools/board-host.ps1` 을 띄워 두면 VM 은 랜으로만 보드를 다룬다:
+비트스트림은 `HW_SERVER=<보드PC>:3121 ./coral program`, 콘솔은 `nc <보드PC> 5000`.
+**`load`/`up` 의 원격판(OpenOCD 대신 Vivado JTAG Tcl 로 디버그 포트 접근)은 작업 중**이다 —
+OpenOCD 는 USB-JTAG 을 직접 잡아야 해서 네트워크 너머의 보드에는 쓸 수 없다.
 
 ## 패치 추가하는 법
 
