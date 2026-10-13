@@ -34,28 +34,34 @@ work/ out/ .tools/  (git 제외) 상류 체크아웃 / 산출물 / 내려받은 
 
 ## 처음 한 번
 
-두 PC 구성이다: **빌드 VM**(Vivado, `coral`) 과 **보드 PC**(VCU118 USB 가 꽂힌 서버).
+**기본 구성: 연구실 서버 fractal 한 대.** VCU118 의 USB(J106 JTAG, J4 UART)를 fractal 에 꽂고
+빌드·다운로드·디버그·콘솔을 전부 fractal 에서 한다 (Ubuntu 24.04, 24 코어, 125 GB).
 
-| 스크립트 | 어디서 | 하는 일 |
-|---|---|---|
-| `tools/create-vcu118-vm.ps1` | Windows (내 PC) | Ubuntu 22.04.5 VM 생성, MAC 고정(라이선스 Host ID), 무인 설치 |
-| `tools/vm-setup.sh` | VM 안 | 패키지, Vivado 2026.1 (Virtex UltraScale+ 만), 라이선스 안내, `coral setup` |
-| `tools/board-host.ps1` | 보드 PC (Windows) | hw_server 실행 + CP2105 COM 포트 → TCP 5000/5001 중계 |
-
-```powershell
-# 내 PC (PowerShell 5.1)
-powershell -ExecutionPolicy Bypass -File tools\create-vcu118-vm.ps1
-```
 ```bash
-# VM 안
 git clone https://github.com/SOTA-PNU/Coralnpu-vcu118.git && cd Coralnpu-vcu118
-./tools/vm-setup.sh          # 멈춘 곳의 안내를 따르고 다시 실행
-./tools/vm-setup.sh license ~/Downloads/Xilinx.lic
+./tools/setup-host.sh        # 멈춘 곳의 안내를 따르고 다시 실행
+./tools/setup-host.sh license ~/Downloads/Xilinx.lic
 ./coral build                # 비트스트림 + hello.elf + 설정 → out/   (Vivado P&R, 1시간+)
+./coral up
 ```
+
+`setup-host.sh` 가 하는 일: 패키지(openocd, picocom 포함), libtinfo.so.5 (24.04 는 .so.6 로 링크),
+VCU118 USB udev 규칙, Vivado 2026.1 설치(ML Enterprise, Virtex UltraScale+ 만),
+Digilent 케이블 드라이버, 라이선스 안내(이 호스트의 MAC), `coral setup`.
+서버에 모니터가 없으면 Vivado 설치 파일은 내 PC 브라우저에서 받아 `scp` 로 `~/Downloads` 에 넣는다.
+
+공용 서버이므로 `coral` 은 **내 hw_server 만** 종료한다. 다른 사용자의 hw_server 가 JTAG 을
+잡고 있으면 멈추고 알려 준다.
 
 `CONFIG=vector_highmem ./coral build` 로 ITCM/DTCM 각 1 MB 판을 만든다 (DDR 이 아직 없으므로
 큰 프로그램은 이 판).
+
+### 다른 구성 (보조)
+
+| 스크립트 | 언제 |
+|---|---|
+| `tools/create-vcu118-vm.ps1` | 리눅스 서버가 없을 때 Windows 에 Ubuntu 22.04 VM 을 만든다 (MAC 고정) |
+| `tools/board-host.ps1` | 보드가 Windows PC 에 꽂혀 있을 때: hw_server + COM→TCP 중계 |
 
 ## 보드 연결
 
@@ -67,12 +73,11 @@ git clone https://github.com/SOTA-PNU/Coralnpu-vcu118.git && cd Coralnpu-vcu118
 
 LED: `0` 클럭 lock · `1` 하트비트 · `2` halted · `3` fault · `7:4` ROM 이 돌리는 패턴.
 
-### 보드가 다른 PC 에 꽂혀 있을 때 (현재 구성)
+### 보드가 다른 PC 에 꽂혀 있을 때
 
-보드 PC 에서 `tools/board-host.ps1` 을 띄워 두면 VM 은 랜으로만 보드를 다룬다:
-비트스트림은 `HW_SERVER=<보드PC>:3121 ./coral program`, 콘솔은 `nc <보드PC> 5000`.
-**`load`/`up` 의 원격판(OpenOCD 대신 Vivado JTAG Tcl 로 디버그 포트 접근)은 작업 중**이다 —
-OpenOCD 는 USB-JTAG 을 직접 잡아야 해서 네트워크 너머의 보드에는 쓸 수 없다.
+빌드 머신과 보드 PC 가 다르면 비트스트림은 `HW_SERVER=<보드PC>:3121 ./coral program` 으로
+올릴 수 있지만, `load`/`up` 은 OpenOCD 가 USB-JTAG 을 직접 잡아야 하므로 보드가 꽂힌 머신에서
+실행해야 한다.
 
 ## 패치 추가하는 법
 

@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Prepare the Ubuntu 22.04 build VM: system packages, Vivado 2026.1, license.
-# Every step checks whether it is already done, so just re-run after fixing
-# whatever it stopped on.
+# Prepare the Linux machine that builds and runs CoralNPU on the VCU118:
+# system packages, USB permissions, Vivado 2026.1, license, upstream sources.
+# Works on the lab server (fractal, Ubuntu 24.04, board USB plugged in) and on
+# an Ubuntu 22.04 VM. Every step checks whether it is already done, so just
+# re-run after fixing whatever it stopped on.
 #
-#   ./tools/vm-setup.sh                 do everything that is not done yet
-#   ./tools/vm-setup.sh license <file>  install a .lic file AMD mailed you
+#   ./tools/setup-host.sh                 do everything that is not done yet
+#   ./tools/setup-host.sh license <file>  install a .lic file AMD mailed you
 #
 # What needs a human:
-#   * downloading the Vivado installer (AMD login in the browser)
-#   * the AMD login prompt of "xsetup -b AuthTokenGen"
-#   * generating the node-locked license on the AMD site with this VM's MAC
+#   * downloading the Vivado installer (AMD login in a browser; on a headless
+#     server download it on your PC and scp it into ~/Downloads here)
+#   * the AMD login prompt of "xsetup -b AuthTokenGen" (text, works over SSH)
+#   * generating the node-locked license on the AMD site with this host's MAC
 # shellcheck disable=SC1091,SC2012  # sourced files exist only after install; ls on fixed names
 set -euo pipefail
 
@@ -38,7 +41,7 @@ if [[ "${1:-}" == "license" ]]; then
   lic="${2:-}"
   [[ -f "${lic}" ]] || die "usage: $0 license <Xilinx.lic>"
   grep -qi "$(host_id)" "${lic}" ||
-    warn "this license does not mention this VM's MAC $(host_id); Vivado will reject it"
+    warn "this license does not mention this host's MAC $(host_id); Vivado will reject it"
   mkdir -p "${LIC_DIR}"
   cp -f "${lic}" "${LIC_DIR}/Xilinx.lic"
   echo "installed ${LIC_DIR}/Xilinx.lic"
@@ -46,16 +49,16 @@ if [[ "${1:-}" == "license" ]]; then
 fi
 
 source /etc/os-release
-[[ "${ID}" == ubuntu && "${VERSION_ID}" == 22.04 ]] ||
-  warn "expected Ubuntu 22.04, found ${PRETTY_NAME}"
+[[ "${ID}" == ubuntu && ( "${VERSION_ID}" == 22.04 || "${VERSION_ID}" == 24.04 ) ]] ||
+  warn "tested on Ubuntu 22.04/24.04, found ${PRETTY_NAME}"
 
 # ---------------------------------------------------------------------------
 step "1/5 system packages"
 pkgs=(
   git curl ca-certificates unzip xz-utils binutils build-essential python3 python3-venv
-  netcat-openbsd picocom
-  # Vivado on Ubuntu (UG973; libtinfo.so.5 per AR# 76616) and its GUI
-  libtinfo5 libncurses5 locales libx11-6 libxext6 libxrender1 libxtst6 libxi6 libfreetype6 fontconfig
+  netcat-openbsd picocom openocd usbutils
+  # Vivado's runtime (GUI libs are also needed in batch mode)
+  locales libx11-6 libxext6 libxrender1 libxtst6 libxi6 libfreetype6 fontconfig
 )
 missing=()
 for p in "${pkgs[@]}"; do dpkg -s "${p}" >/dev/null 2>&1 || missing+=("${p}"); done
@@ -67,6 +70,35 @@ else
 fi
 locale -a | grep -qi '^en_US.utf8$' || sudo locale-gen en_US.UTF-8
 
+# Vivado needs libtinfo.so.5 (UG973, AR# 76616). Ubuntu 22.04 still ships the
+# libtinfo5 package; 24.04 dropped it, so point the old soname at the new library.
+libdir=/usr/lib/x86_64-linux-gnu
+if [[ ! -e "${libdir}/libtinfo.so.5" ]]; then
+  if apt-cache show libtinfo5 >/dev/null 2>&1; then
+    sudo apt-get install -y libtinfo5 libncurses5
+  else
+    sudo ln -s "${libdir}/libtinfo.so.6" "${libdir}/libtinfo.so.5"
+    [[ -e "${libdir}/libncurses.so.5" ]] || sudo ln -s "${libdir}/libncursesw.so.6" "${libdir}/libncurses.so.5"
+    echo "linked libtinfo.so.5 / libncurses.so.5 to the .so.6 libraries"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+step "USB permissions for the VCU118 (JTAG 0403:6014, UART 10c4:ea70)"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+rules=/etc/udev/rules.d/60-vcu118.rules
+if ! cmp -s "${here}/udev/60-vcu118.rules" "${rules}"; then
+  sudo mkdir -p "$(dirname "${rules}")"
+  sudo cp "${here}/udev/60-vcu118.rules" "${rules}"
+  if command -v udevadm >/dev/null; then
+    sudo udevadm control --reload || true
+    sudo udevadm trigger || true
+  fi
+  echo "installed ${rules}"
+fi
+if lsusb -d 0403:6014 >/dev/null; then echo "JTAG  : $(lsusb -d 0403:6014)"; else warn "VCU118 JTAG not visible (board off? cable on J106?)"; fi
+if lsusb -d 10c4:ea70 >/dev/null; then echo "UART  : $(lsusb -d 10c4:ea70)"; else warn "VCU118 UART not visible (cable on J4?)"; fi
+
 # ---------------------------------------------------------------------------
 step "2/5 Vivado ${VIVADO_VER}"
 if [[ -x "${VIVADO_DIR}/bin/vivado" ]]; then
@@ -75,11 +107,13 @@ else
   bin="$(ls -1 "${HOME}"/Downloads/FPGAs_AdaptiveSoCs_Unified*"${VIVADO_VER}"*Lin64.bin 2>/dev/null | head -n1 || true)"
   if [[ -z "${bin}" ]]; then
     cat <<EOF
-The Vivado installer is not in ~/Downloads yet. In this VM's Firefox:
+The Vivado installer is not in ~/Downloads yet. In a browser:
   https://www.xilinx.com/support/download.html
   -> Vivado (HW Developer) ${VIVADO_VER}
   -> "AMD Unified Installer for FPGAs & Adaptive SoCs ${VIVADO_VER}: Linux Self Extracting Web Installer" (.bin, ~300 MB)
   (AMD account login required)
+Headless server: download it on your PC, then
+  scp FPGAs_AdaptiveSoCs_Unified_*_Lin64.bin $(whoami)@$(hostname -I | awk '{print $1}'):~/Downloads/
 Then run this script again.
 EOF
     exit 1
@@ -144,6 +178,12 @@ PY
   if [[ -n "${libs}" ]]; then step "Vivado's own dependency script"; sudo "${libs}"; fi
 fi
 
+drv="$(ls -1d "${VIVADO_DIR}"/data/xicom/cable_drivers/lin64/install_script/install_drivers 2>/dev/null | head -n1 || true)"
+if [[ -n "${drv}" ]] && ! ls /etc/udev/rules.d/*digilent* >/dev/null 2>&1; then
+  step "Vivado cable drivers (Digilent udev rules)"
+  (cd "${drv}" && sudo ./install_drivers)
+fi
+
 # ---------------------------------------------------------------------------
 step "3/5 shell environment"
 line="source ${VIVADO_DIR}/settings64.sh"
@@ -157,18 +197,17 @@ if ls "${LIC_DIR}"/*.lic >/dev/null 2>&1 && grep -qi "${id}" "${LIC_DIR}"/*.lic;
   echo "found a license for this VM in ${LIC_DIR}"
 else
   cat <<EOF
-No license for this VM yet. Host ID (MAC) of this VM: ${id}
+No license for this host yet. Host ID (MAC) of this host: ${id}
   1. https://www.xilinx.com/getlicense  -> Create New Licenses
   2. tick the "Virtex UltraScale+ FPGA VCU118 Vivado Design Edition" voucher line
   3. Generate Node-Locked License -> Host ID type "Ethernet MAC", value ${id}
-  4. save the .lic AMD e-mails you, then:  ./tools/vm-setup.sh license ~/Downloads/Xilinx.lic
+  4. save the .lic AMD e-mails you, then:  ./tools/setup-host.sh license ~/Downloads/Xilinx.lic
 Synthesis for xcvu9p fails without it; everything else here works.
 EOF
 fi
 
 # ---------------------------------------------------------------------------
 step "5/5 CoralNPU sources"
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 "${here}/coral" setup
 echo
-echo "VM ready. Next: ./coral build   (Vivado synthesis + P&R, an hour or more)"
+echo "Host ready. Next: ./coral build   (Vivado synthesis + P&R, an hour or more)"

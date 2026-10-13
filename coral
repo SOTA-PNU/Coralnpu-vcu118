@@ -139,7 +139,8 @@ cmd_program() {
   (cd "${OUT}" && vivado -mode batch -nojournal -nolog -notrace \
       -source "${ROOT}/vivado/program.tcl" -tclargs "${bit}" "${HW_SERVER}")
   # A local hw_server keeps the USB-JTAG open; OpenOCD needs it free.
-  if [[ "${HW_SERVER}" == localhost:* ]]; then pkill -x hw_server 2>/dev/null || true; fi
+  # (only our own: on a shared server other users may run hw_server too)
+  if [[ "${HW_SERVER}" == localhost:* ]]; then pkill -u "$(id -u)" -x hw_server 2>/dev/null || true; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -156,8 +157,11 @@ openocd_cfg() {
 cmd_load() {
   local elf="${1:-}"
   [[ -f "${elf}" ]] || die "usage: ./coral load <program.elf>"
-  pgrep -x hw_server >/dev/null &&
-    die "hw_server is running and holds the JTAG cable. Close Vivado Hardware Manager / pkill hw_server"
+  if pgrep -x hw_server >/dev/null; then
+    pgrep -u "$(id -u)" -x hw_server >/dev/null &&
+      die "your hw_server holds the JTAG cable. Close Vivado Hardware Manager or: pkill -u \$USER -x hw_server"
+    die "another user's hw_server ($(pgrep -a -x hw_server | head -n1)) holds the JTAG cable; ask them to close it"
+  fi
   local cfg entry
   cfg="$(openocd_cfg)"
   entry="$(readelf -h "${elf}" | awk '/Entry point address/ {print $4}')"
