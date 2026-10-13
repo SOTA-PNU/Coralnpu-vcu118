@@ -185,14 +185,23 @@ PY
   "${STAGE}/xsetup" --agree XilinxEULA,3rdPartyEULA --batch Install --config "${cfg}"
   [[ -x "${VIVADO_DIR}/bin/vivado" ]] || die "install finished but ${VIVADO_DIR}/bin/vivado is missing"
 
-  libs="$(ls -1 "${INSTALL_ROOT}/${VIVADO_VER}"/*/scripts/installLibs.sh 2>/dev/null | head -n1 || true)"
-  if [[ -n "${libs}" ]]; then step "Vivado's own dependency script"; sudo "${libs}"; fi
+fi
+
+# Vivado's own OS-package script. Run it through bash: on 2026.1 executing it
+# directly failed with "unable to execute ... No such file or directory" (a
+# shebang/line-ending problem), although the file is there. Done once, marked.
+libs="$(ls -1 "${INSTALL_ROOT}/${VIVADO_VER}"/*/scripts/installLibs.sh 2>/dev/null | head -n1 || true)"
+mark="${HOME}/.Xilinx/.installLibs-${VIVADO_VER}.done"
+if [[ -n "${libs}" && ! -f "${mark}" ]]; then
+  step "Vivado's own dependency script (${libs})"
+  if sudo bash "${libs}"; then mkdir -p "$(dirname "${mark}")"; touch "${mark}"
+  else warn "installLibs.sh failed; Vivado may still run (needed packages were installed in step 1)"; fi
 fi
 
 drv="$(ls -1d "${VIVADO_DIR}"/data/xicom/cable_drivers/lin64/install_script/install_drivers 2>/dev/null | head -n1 || true)"
 if [[ -n "${drv}" ]] && ! ls /etc/udev/rules.d/*digilent* >/dev/null 2>&1; then
   step "Vivado cable drivers (Digilent udev rules)"
-  (cd "${drv}" && sudo ./install_drivers)
+  (cd "${drv}" && sudo bash ./install_drivers) || warn "cable driver install failed; JTAG may need sudo"
 fi
 
 # ---------------------------------------------------------------------------
