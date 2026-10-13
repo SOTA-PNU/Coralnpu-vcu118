@@ -18,6 +18,15 @@ HW_SERVER="${HW_SERVER:-localhost:3121}"
 UART_DEV="${UART_DEV:-}"
 UART_BAUD=115200
 
+# Board host for "coral deploy": the machine the VCU118 USB is plugged into
+# (fractal, reached from outside through sota.pusan.ac.kr:10022). Builds that
+# need a Vivado license run elsewhere (the VM); deploy copies out/ there and,
+# with "deploy up", runs "coral up" on it. Programming and debug need no license.
+BOARD_SSH="${BOARD_SSH:-ehdgns1083@sota.pusan.ac.kr}"
+BOARD_SSH_PORT="${BOARD_SSH_PORT:-10022}"
+BOARD_REPO="${BOARD_REPO:-Coralnpu-vcu118}"          # relative to the remote home
+BOARD_VIVADO_SETTINGS="${BOARD_VIVADO_SETTINGS:-/tools/Xilinx/2026.1/Vivado/settings64.sh}"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="${ROOT}/work/coralnpu"
 OUT="${ROOT}/out"

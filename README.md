@@ -34,15 +34,25 @@ work/ out/ .tools/  (git 제외) 상류 체크아웃 / 산출물 / 내려받은 
 
 ## 처음 한 번
 
-**기본 구성: 연구실 서버 fractal 한 대.** VCU118 의 USB(J106 JTAG, J4 UART)를 fractal 에 꽂고
-빌드·다운로드·디버그·콘솔을 전부 fractal 에서 한다 (Ubuntu 24.04, 24 코어, 125 GB).
+**현재 구성 (2026-10-13): 빌드는 VM, 실행은 fractal.**
+Vivado 라이선스는 공용 서버에 묶지 않고 VM(MAC 고정)에 발급한다. 비트스트림 다운로드·디버그·콘솔은
+라이선스가 필요 없으므로 보드 USB 가 꽂힌 fractal 에서 한다.
+
+```
+[VM vcu118-dev]  ./coral build  →  out/*.bit, out/vcu118_hello.elf
+      │  ./coral deploy up   (scp + ssh, sota.pusan.ac.kr:10022)
+      ▼
+[fractal]        ./coral up  (hw_server, OpenOCD, UART — 로컬 USB)
+```
 
 ```bash
+# 양쪽 공통 (VM 과 fractal 각각)
 git clone https://github.com/SOTA-PNU/Coralnpu-vcu118.git && cd Coralnpu-vcu118
 ./tools/setup-host.sh        # 멈춘 곳의 안내를 따르고 다시 실행
+# VM 에서만
 ./tools/setup-host.sh license ~/Downloads/Xilinx.lic
-./coral build                # 비트스트림 + hello.elf + 설정 → out/   (Vivado P&R, 1시간+)
-./coral up
+./coral build
+./coral deploy up            # fractal 로 복사하고 거기서 coral up 실행
 ```
 
 `setup-host.sh` 가 하는 일: 패키지(openocd, picocom 포함), libtinfo.so.5 (24.04 는 .so.6 로 링크),

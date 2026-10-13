@@ -8,8 +8,10 @@
 #   ./coral load <x.elf>      load and run a program over JTAG (OpenOCD)
 #   ./coral console           open the USB-UART console
 #   ./coral up [x.bit]        program + wait for the ROM banner + run hello.elf
+#   ./coral deploy [up]       copy out/ to the board host (fractal); "up" also runs
+#                             "coral up" there (build in the licensed VM, run on fractal)
 #
-# Environment overrides: CONFIG, HW_SERVER, UART_DEV (see config.sh).
+# Environment overrides: CONFIG, HW_SERVER, UART_DEV, BOARD_SSH* (see config.sh).
 set -euo pipefail
 source "$(dirname "$(readlink -f "$0")")/config.sh"
 
@@ -231,8 +233,36 @@ cmd_up() {
 }
 
 # ---------------------------------------------------------------------------
+# shellcheck disable=SC2029  # remote paths are meant to expand here
+cmd_deploy() {
+  local then="${1:-}"
+  local bit="${OUT}/chip_vcu118_${CONFIG}.bit" elf="${OUT}/vcu118_hello.elf"
+  [[ -f "${bit}" && -f "${elf}" ]] || die "nothing to deploy: run ./coral build first (${bit})"
+  local ssh_opts=(-p "${BOARD_SSH_PORT}" -o ServerAliveInterval=30)
+  local remote_out="${BOARD_REPO}/out"
+  info "deploying out/ to ${BOARD_SSH}:${remote_out} (port ${BOARD_SSH_PORT})"
+  # One SSH connection for all steps, so the password is asked once.
+  local ctl; ctl="$(mktemp -u "${TMPDIR:-/tmp}/coral-ssh-XXXXXX")"
+  ssh "${ssh_opts[@]}" -o ControlMaster=yes -o ControlPath="${ctl}" -o ControlPersist=120 -fN "${BOARD_SSH}"
+  ssh_opts+=(-o ControlPath="${ctl}")
+  ssh "${ssh_opts[@]}" "${BOARD_SSH}" "test -d ${BOARD_REPO} || git clone -q https://github.com/SOTA-PNU/Coralnpu-vcu118.git ${BOARD_REPO}; mkdir -p ${remote_out}"
+  local files=("${bit}" "${elf}")
+  local f
+  for f in "${OUT}"/*.rpt; do [[ -e "${f}" ]] && files+=("${f}"); done
+  scp -P "${BOARD_SSH_PORT}" -o ControlPath="${ctl}" "${files[@]}" "${BOARD_SSH}:${remote_out}/"
+  if [[ "${then}" == up ]]; then
+    info "running coral up on the board host"
+    ssh -t "${ssh_opts[@]}" "${BOARD_SSH}" \
+      "cd ${BOARD_REPO} && git pull -q --ff-only && source ${BOARD_VIVADO_SETTINGS} && CONFIG=${CONFIG} ./coral up"
+  else
+    info "done. On the board host: cd ${BOARD_REPO} && ./coral up"
+  fi
+  ssh -o ControlPath="${ctl}" -O exit "${BOARD_SSH}" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
 sub="${1:-}"; shift || true
 case "${sub}" in
-  doctor|setup|build|program|load|console|up) "cmd_${sub}" "$@" ;;
-  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  doctor|setup|build|program|load|console|up|deploy) "cmd_${sub}" "$@" ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
