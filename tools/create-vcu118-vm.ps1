@@ -38,19 +38,30 @@ function Warn($msg) { Write-Host "WARN: $msg" -ForegroundColor Yellow }
 # --- 1. VirtualBox --------------------------------------------------------------
 $VBox = Join-Path $env:ProgramFiles 'Oracle\VirtualBox\VBoxManage.exe'
 if (-not (Test-Path $VBox)) { Fail "VBoxManage not found at $VBox. Is VirtualBox installed?" }
+# PowerShell 5.1 turns every stderr line of a native program into an error record
+# when it is redirected (2>&1), and with ErrorActionPreference=Stop that aborts the
+# script. VBoxManage prints progress ("0%...10%...") on stderr, so run it with
+# Continue and judge success by the exit code only.
 function VB {
-    $out = & $VBox @args 2>&1
-    if ($LASTEXITCODE -ne 0) { Fail "VBoxManage $($args -join ' ') failed:`n$out" }
+    $ErrorActionPreference = 'Continue'
+    $out = & $VBox @args 2>&1 | ForEach-Object { "$_" }
+    if ($LASTEXITCODE -ne 0) { Fail "VBoxManage $($args -join ' ') failed:`n$($out -join "`n")" }
     return $out
 }
-function VBTry { & $VBox @args 2>&1 | Out-Null; return ($LASTEXITCODE -eq 0) }
+function VBTry {
+    $ErrorActionPreference = 'Continue'
+    & $VBox @args 2>&1 | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+function VmInfo { $ErrorActionPreference = 'Continue'; & $VBox showvminfo $VmName --machinereadable 2>$null }
 
 Step "VirtualBox $((& $VBox --version) -join '')"
 
 $existing = (& $VBox list vms) -join "`n"
-if ($existing -match ('"' + [regex]::Escape($VmName) + '"')) {
-    $mac = ((& $VBox showvminfo $VmName --machinereadable) | Select-String '^macaddress1=' ) -replace '.*="?([0-9A-Fa-f]{12})"?.*', '$1'
-    Fail "VM '$VmName' already exists (MAC $mac). Delete it in VirtualBox or pass -VmName <other>."
+$Resume = $existing -match ('"' + [regex]::Escape($VmName) + '"')
+if ($Resume) {
+    $Mac = "$((VmInfo) | Select-String '^macaddress1=')" -replace '.*="?([0-9A-Fa-f]{12})"?.*', '$1'
+    Step "VM '$VmName' exists (MAC $Mac): resuming, the MAC is kept"
 }
 
 # --- host resources ---------------------------------------------------------------
@@ -103,20 +114,24 @@ try {
 } catch { Warn "could not fetch SHA256SUMS ($($_.Exception.Message)); skipping check" }
 
 # --- 3. VM ------------------------------------------------------------------------
-# VirtualBox OUI 08:00:27 + random tail. Fixed so the Vivado license keeps working.
-$rand = -join ((1..6) | ForEach-Object { '{0:X}' -f (Get-Random -Maximum 16) })
-$Mac  = "080027$rand"
-
-Step "creating VM '$VmName' in $VmDir"
-VB createvm --name $VmName --ostype Ubuntu22_LTS_64 --register --basefolder $VmDir | Out-Null
-VB modifyvm $VmName --memory ($vmGB * 1024) --cpus $vmCpu --vram 128 `
-   --graphicscontroller vmsvga --ioapic on --rtcuseutc on `
-   --nic1 nat --macaddress1 $Mac `
-   --clipboard-mode bidirectional --drag-and-drop bidirectional | Out-Null
+if (-not $Resume) {
+    # VirtualBox OUI 08:00:27 + random tail. Fixed so the Vivado license keeps working.
+    $rand = -join ((1..6) | ForEach-Object { '{0:X}' -f (Get-Random -Maximum 16) })
+    $Mac  = "080027$rand"
+    Step "creating VM '$VmName' in $VmDir"
+    VB createvm --name $VmName --ostype Ubuntu22_LTS_64 --register --basefolder $VmDir | Out-Null
+    VB modifyvm $VmName --memory ($vmGB * 1024) --cpus $vmCpu --vram 128 `
+       --graphicscontroller vmsvga --ioapic on --rtcuseutc on `
+       --nic1 nat --macaddress1 $Mac `
+       --clipboard-mode bidirectional --drag-and-drop bidirectional | Out-Null
+}
 
 $disk = Join-Path (Join-Path $VmDir $VmName) "$VmName.vdi"
-VB createmedium disk --filename $disk --size ($DiskGB * 1024) --format VDI | Out-Null
-VB storagectl $VmName --name SATA --add sata --controller IntelAhci --portcount 2 | Out-Null
+if (Test-Path $disk) { Step "disk exists: $disk" }
+else { VB createmedium disk --filename $disk --size ($DiskGB * 1024) --format VDI | Out-Null }
+if ("$(VmInfo)" -notmatch 'storagecontrollername0="SATA"') {
+    VB storagectl $VmName --name SATA --add sata --controller IntelAhci --portcount 2 | Out-Null
+}
 VB storageattach $VmName --storagectl SATA --port 0 --device 0 --type hdd --medium $disk | Out-Null
 VB storageattach $VmName --storagectl SATA --port 1 --device 0 --type dvddrive --medium $IsoPath | Out-Null
 
@@ -149,8 +164,10 @@ if ($usb -eq 'none') {
 } else {
     Step "USB controller: $usb"
     # Auto-attach the two VCU118 USB devices whenever they are plugged in.
+    if ("$(VmInfo)" -notmatch 'USBFilterName1=') {
     VBTry usbfilter add 0 --target $VmName --name 'VCU118 JTAG (Digilent SMT2-NC)' --vendorid 0403 --productid 6014 | Out-Null
     VBTry usbfilter add 1 --target $VmName --name 'VCU118 UART (CP2105)' --vendorid 10c4 --productid ea70 | Out-Null
+    }
 }
 
 # --- 5. record what the license needs ---------------------------------------------
@@ -179,19 +196,23 @@ if ($NoUnattended) {
     $pwFile = Join-Path $env:TEMP "vbox-pw-$([guid]::NewGuid()).txt"
     [IO.File]::WriteAllText($pwFile, $pw)
     # VirtualBox 7.1 renamed --password-file to --user-password-file; use whichever this one knows.
-    $help = (& $VBox unattended install --help 2>&1) -join "`n"
+    $ErrorActionPreference = 'Continue'
+    $help = (& $VBox unattended install --help 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    $ErrorActionPreference = 'Stop'
     $pwOpt = '--password-file'
     if ($help -match '--user-password-file') { $pwOpt = '--user-password-file' }
     try {
         Step 'starting unattended Ubuntu install (20-40 min, the VM window shows progress)'
+        $ErrorActionPreference = 'Continue'
         & $VBox unattended install $VmName --iso=$IsoPath --user=$user "$pwOpt=$pwFile" `
             --full-user-name=$user --hostname="$VmName.local" --locale=en_US --country=KR `
-            --time-zone=Asia/Seoul --install-additions --start-vm=gui 2>&1 | Write-Host
+            --time-zone=Asia/Seoul --install-additions --start-vm=gui 2>&1 | ForEach-Object { Write-Host "$_" }
         if ($LASTEXITCODE -ne 0) {
             Warn 'unattended install could not start; booting the ISO for a manual install instead'
             VB startvm $VmName --type gui | Out-Null
         }
     } finally {
+        $ErrorActionPreference = 'Stop'
         Remove-Item $pwFile -ErrorAction SilentlyContinue
     }
 }
