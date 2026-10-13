@@ -142,31 +142,42 @@ EOF
     [[ "${gen}" == "${cfg}" ]] || cp -f "${gen}" "${cfg}"
   fi
 
-  # Only Virtex UltraScale+ devices: saves ~100 GB of download and disk.
-  # Device entries in Modules= look like "Kintex UltraScale+:1"; turn off every
-  # device family except Virtex UltraScale+ (and keep non-device modules as-is).
-  python3 - "${cfg}" "${INSTALL_ROOT}" <<'PY'
+  # Only what the VCU118 needs: the Virtex UltraScale+ device family.
+  # 2026.1 lists families as "Virtex UltraScale+ FPGAs:0", Versal parts by name
+  # ("xcvp1902:0") and add-ons such as "Vitis Model Composer(...):1" in one
+  # Modules= line. Whitelist: our family on, DocNav as offered, everything else off.
+  rc=0
+  python3 - "${cfg}" "${INSTALL_ROOT}" <<'PY' || rc=$?
 import re, sys
 path, root = sys.argv[1], sys.argv[2]
 s = open(path).read()
-fams = ("Spartan", "Artix", "Kintex", "Zynq", "Virtex", "Versal", "Engineering Sample", "Install Devices")
+WANT = {"Virtex UltraScale+ FPGAs", "Virtex UltraScale+"}   # 2026.1 / older naming
+KEEP = {"DocNav"}
+found = []
 def fix(m):
     out = []
     for item in m.group(1).split(","):
         name, _, val = item.rpartition(":")
-        if name and any(name.strip().startswith(f) for f in fams):
-            val = "1" if name.strip() == "Virtex UltraScale+" else "0"
-        out.append(f"{name}:{val}" if name else item)
+        if not name:
+            out.append(item); continue
+        n = name.strip()
+        if n in WANT:
+            val = "1"; found.append(n)
+        elif n not in KEEP:
+            val = "0"
+        out.append(f"{name}:{val}")
     return "Modules=" + ",".join(out)
-s, n = re.subn(r"(?m)^Modules=(.*)$", fix, s)
+s = re.sub(r"(?m)^Modules=(.*)$", fix, s)
 s = re.sub(r"(?m)^Destination=.*$", f"Destination={root}", s)
+# headless server: no desktop/menu shortcuts
+for k in ("CreateProgramGroupShortcuts", "CreateDesktopShortcuts", "CreateFileAssociation"):
+    s = re.sub(rf"(?m)^{k}=.*$", f"{k}=0", s)
 open(path, "w").write(s)
-on = re.search(r"(?m)^Modules=(.*)$", s).group(1)
-print("device families enabled:", [x.rpartition(":")[0] for x in on.split(",")
-      if x.endswith(":1") and any(x.startswith(f) for f in fams)])
+on = [x.rpartition(":")[0] for x in re.search(r"(?m)^Modules=(.*)$", s).group(1).split(",") if x.endswith(":1")]
+print("modules enabled:", on)
+sys.exit(0 if found else 3)
 PY
-  grep -q 'Virtex UltraScale+:1' "${cfg}" ||
-    die "Virtex UltraScale+ is not enabled in ${cfg}; edit Modules= by hand"
+  [[ ${rc} -eq 0 ]] || die "no Virtex UltraScale+ entry in Modules= of ${cfg}; send this file's Modules= line"
 
   step "installing to ${INSTALL_ROOT} (downloads tens of GB; 1-2 hours)"
   sudo mkdir -p "${INSTALL_ROOT}"
