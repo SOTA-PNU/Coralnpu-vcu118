@@ -115,6 +115,13 @@ cmd_build() {
   [[ -n "${XILINXD_LICENSE_FILE:-}" ]] ||
     die "no Vivado license: ./tools/setup-host.sh license <file> (or set XILINXD_LICENSE_FILE)"
   info "license: ${XILINXD_LICENSE_FILE}"
+  # Vivado synthesis of the RVV subsystem was OOM-killed with 20 GB RAM + 2 GB swap.
+  local mem_gb
+  mem_gb=$(awk '/^(MemTotal|SwapTotal):/ {s+=$2} END {print int(s/1048576)}' /proc/meminfo)
+  if (( mem_gb < 40 )); then
+    echo "WARN: RAM+swap is ${mem_gb} GB; Vivado synthesis needs ~40 GB. Add swap:" >&2
+    echo "      sudo fallocate -l 32G /swapfile-build && sudo chmod 600 /swapfile-build && sudo mkswap /swapfile-build && sudo swapon /swapfile-build" >&2
+  fi
   [[ -f "${WORK}/fpga/rtl/chip_vcu118.sv" ]] || cmd_setup
   local bz bit_target
   bz="$(bazel_cmd)"
