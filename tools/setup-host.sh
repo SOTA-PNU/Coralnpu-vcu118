@@ -59,14 +59,35 @@ pkgs=(
   netcat-openbsd picocom openocd usbutils
   # Vivado's runtime (GUI libs are also needed in batch mode)
   locales libx11-6 libxext6 libxrender1 libxtst6 libxi6 libfreetype6 fontconfig
+  # Upstream CoralNPU build host, from utils/coralnpu.dockerfile (CI image).
+  # .bazelrc sets CC=clang, so clang must exist; lld for the C++ tools.
+  clang lld autoconf ccache cmake ninja-build gawk device-tree-compiler srecord xxd zip
+  libelf-dev libftdi1-dev liblz4-dev libmpfr-dev libusb-1.0-0-dev libzstd-dev zlib1g-dev
+  python-is-python3 python3-numpy python3-pip python3-setuptools
+  openjdk-21-jdk-headless
 )
 missing=()
 for p in "${pkgs[@]}"; do dpkg -s "${p}" >/dev/null 2>&1 || missing+=("${p}"); done
 if ((${#missing[@]})); then
   sudo apt-get update
-  sudo apt-get install -y "${missing[@]}"
+  # Install what this release offers; report the rest instead of aborting.
+  avail=(); skip=()
+  for p in "${missing[@]}"; do
+    if apt-cache show "${p}" >/dev/null 2>&1; then avail+=("${p}"); else skip+=("${p}"); fi
+  done
+  ((${#avail[@]})) && sudo apt-get install -y "${avail[@]}"
+  ((${#skip[@]})) && warn "not in this Ubuntu release, skipped: ${skip[*]}"
 else
   echo "all present"
+fi
+command -v clang >/dev/null || die "clang missing: the upstream .bazelrc builds with CC=clang"
+
+# The prebuilt RISC-V toolchain links against libmpfr.so.4 (upstream works
+# around it the same way in its dockerfile).
+mpfr4=/usr/lib/x86_64-linux-gnu/libmpfr.so.4
+if [[ ! -e "${mpfr4}" && -e /usr/lib/x86_64-linux-gnu/libmpfr.so.6 ]]; then
+  sudo ln -s /usr/lib/x86_64-linux-gnu/libmpfr.so.6 "${mpfr4}"
+  echo "linked libmpfr.so.4 -> libmpfr.so.6"
 fi
 locale -a | grep -qi '^en_US.utf8$' || sudo locale-gen en_US.UTF-8
 

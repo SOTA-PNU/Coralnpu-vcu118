@@ -107,6 +107,14 @@ bazel_files() {  # print output files of a target
 
 cmd_build() {
   need_vivado
+  # The FuseSoC rule runs Vivado with a fake HOME, so ~/.Xilinx/Xilinx.lic is
+  # not found there; upstream .bazelrc forwards XILINXD_LICENSE_FILE instead.
+  if [[ -z "${XILINXD_LICENSE_FILE:-}" && -f "${HOME}/.Xilinx/Xilinx.lic" ]]; then
+    export XILINXD_LICENSE_FILE="${HOME}/.Xilinx/Xilinx.lic"
+  fi
+  [[ -n "${XILINXD_LICENSE_FILE:-}" ]] ||
+    die "no Vivado license: ./tools/setup-host.sh license <file> (or set XILINXD_LICENSE_FILE)"
+  info "license: ${XILINXD_LICENSE_FILE}"
   [[ -f "${WORK}/fpga/rtl/chip_vcu118.sv" ]] || cmd_setup
   local bz bit_target
   bz="$(bazel_cmd)"
