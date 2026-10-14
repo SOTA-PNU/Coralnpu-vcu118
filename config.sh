@@ -5,7 +5,9 @@
 CORALNPU_URL="https://github.com/google-coral/coralnpu.git"
 CORALNPU_COMMIT="15573b6929f587fa3ef51b4e4cc2017c850f7e3b"
 
-# SoC variant: vector_normal (ITCM 8K / DTCM 32K) or vector_highmem (1M / 1M).
+# SoC variant (all 50 MHz on VCU118):
+#   vector_normal  (ITCM 8K / DTCM 32K)   vector_highmem (1M / 1M)
+#   matrix_normal  (+ VME/ZVT, 8K / 32K)  matrix_highmem (+ VME/ZVT, 1M / 1M)
 CONFIG="${CONFIG:-vector_normal}"
 
 # Where Vivado's hardware server runs. Default: start one locally (USB in this

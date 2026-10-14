@@ -122,7 +122,7 @@ cmd_build() {
     echo "WARN: RAM+swap is ${mem_gb} GB; Vivado synthesis needs ~40 GB. Add swap:" >&2
     echo "      sudo fallocate -l 32G /swapfile-build && sudo chmod 600 /swapfile-build && sudo mkswap /swapfile-build && sudo swapon /swapfile-build" >&2
   fi
-  [[ -f "${WORK}/fpga/rtl/chip_vcu118.sv" ]] || cmd_setup
+  ( cmd_setup )   # idempotent; picks up patches added since the last build
   local bz bit_target
   bz="$(bazel_cmd)"
   bit_target="//fpga:build_chip_vcu118_bitstream_${CONFIG}"
@@ -137,8 +137,9 @@ cmd_build() {
   bit="$(find "${WORK}/${dir}" -name '*.bit' | head -n1)"
   [[ -n "${bit}" ]] || die "no .bit under ${dir}"
   cp -f "${bit}" "${OUT}/chip_vcu118_${CONFIG}.bit"
-  find "${WORK}/${dir}" -name '*utilization*.rpt' -exec cp -f {} "${OUT}/" \; 2>/dev/null || true
-  find "${WORK}/${dir}" -name '*timing*.rpt' -exec cp -f {} "${OUT}/" \; 2>/dev/null || true
+  mkdir -p "${OUT}/reports_${CONFIG}"
+  find "${WORK}/${dir}" \( -name '*utilization*.rpt' -o -name '*timing*.rpt' \) \
+    -exec cp -f {} "${OUT}/reports_${CONFIG}/" \; 2>/dev/null || true
 
   elf="$(bazel_files //fpga:vcu118_hello.elf | head -n1)"
   cp -f "${WORK}/${elf}" "${OUT}/vcu118_hello.elf"

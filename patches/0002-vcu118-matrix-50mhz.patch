@@ -1,0 +1,69 @@
+From 65a370f82f80172ec6e28082dd1921a8ab3eeba7 Mon Sep 17 00:00:00 2001
+From: SOTA-PNU <noreply@anthropic.com>
+Date: Wed, 14 Oct 2026 18:12:27 +0900
+Subject: [PATCH] fpga: VCU118 matrix (VME/ZVT) variants at 50 MHz
+
+Expose build_chip_vcu118_*_matrix_{normal,highmem} and pass the config's
+ZVT flags through. Every VCU118 variant runs at 50 MHz.
+---
+ fpga/BUILD | 28 +++++++++++++++++++++-------
+ 1 file changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/fpga/BUILD b/fpga/BUILD
+index cf2fe30..83f1939 100644
+--- a/fpga/BUILD
++++ b/fpga/BUILD
+@@ -923,6 +923,7 @@ collect_coralnpu_elfs()
+ #
+ #   bazel build //fpga:build_chip_vcu118_synth_only_vector_normal   # LUT count
+ #   bazel build //fpga:build_chip_vcu118_bitstream_vector_normal    # .bit
++#   bazel build //fpga:build_chip_vcu118_bitstream_matrix_normal    # .bit with VME
+ #   bazel build //fpga:vcu118_hello                                 # first ELF
+ # -----------------------------------------------------------------------------
+ 
+@@ -986,15 +987,27 @@ VCU118_COMMON_CORES = [
+     "//fpga/ip/ispyocto:ispyocto_core",
+ ]
+ 
+-# Only the vector (no VME) variants: they are the ones sized for a VU9P.
++# All four variants. The VCU118 runs every one at 50 MHz, including the
++# matrix (VME/ZVT) ones that Nexus clocks at 30 MHz; check WNS in the
++# timing report before trusting a matrix bitstream.
++_VCU118_CLOCK_FREQUENCY_MHZ = "50"
++
++_VCU118_PARK_VMEM = {
++    "vector_normal": "vcu118_rom_park_vmem",
++    "vector_highmem": "vcu118_rom_park_highmem_vmem",
++    "matrix_normal": "vcu118_rom_park_vmem",
++    "matrix_highmem": "vcu118_rom_park_highmem_vmem",
++}
++
+ _VCU118_CONFIGS = [
+-    dict(c, park_vmem = ":vcu118_rom_park_vmem", park_vmem_file = "$(location :vcu118_rom_park_vmem)")
+-    for c in _ALL_CONFIGS
+-    if c["name"] == "vector_normal"
+-] + [
+-    dict(c, park_vmem = ":vcu118_rom_park_highmem_vmem", park_vmem_file = "$(location :vcu118_rom_park_highmem_vmem)")
++    dict(
++        c,
++        clock_frequency_mhz = _VCU118_CLOCK_FREQUENCY_MHZ,
++        park_vmem = ":" + _VCU118_PARK_VMEM[c["name"]],
++        park_vmem_file = "$(location :" + _VCU118_PARK_VMEM[c["name"]] + ")",
++    )
+     for c in _ALL_CONFIGS
+-    if c["name"] == "vector_highmem"
++    if c["name"] in _VCU118_PARK_VMEM
+ ]
+ 
+ _VCU118_NAME_MAP = {
+@@ -1007,6 +1020,7 @@ _VCU118_NAME_MAP = {
+             "--SpimClockFrequencyMhz=" + _SPIM_CLOCK_FREQUENCY_MHZ,
+             "--ItcmSizeKBytes=" + c["itcm"],
+             "--DtcmSizeKBytes=" + c["dtcm"],
++        ] + c["zvt_flags"] + [
+             # Boot the park ROM; the autoboot FSM releases the core's clock
+             # gate and reset at power-up, so no host write is needed.
+             "--EnableAutoboot=1",
+-- 
+2.43.0
+

@@ -63,8 +63,20 @@ Digilent 케이블 드라이버, 라이선스 안내(이 호스트의 MAC), `cor
 공용 서버이므로 `coral` 은 **내 hw_server 만** 종료한다. 다른 사용자의 hw_server 가 JTAG 을
 잡고 있으면 멈추고 알려 준다.
 
-`CONFIG=vector_highmem ./coral build` 로 ITCM/DTCM 각 1 MB 판을 만든다 (DDR 이 아직 없으므로
-큰 프로그램은 이 판).
+`CONFIG=<구성> ./coral build` 로 다른 판을 만든다. 모두 50 MHz.
+
+| CONFIG | 유닛 | ITCM / DTCM |
+|---|---|---|
+| `vector_normal` (기본) | 스칼라 + RVV | 8 KB / 32 KB |
+| `vector_highmem` | 스칼라 + RVV | 1 MB / 1 MB |
+| `matrix_normal` | 스칼라 + RVV + 매트릭스(VME/ZVT) | 8 KB / 32 KB |
+| `matrix_highmem` | 스칼라 + RVV + 매트릭스(VME/ZVT) | 1 MB / 1 MB |
+
+상류 Nexus 는 매트릭스 판을 30 MHz 로 돌린다. VCU118 은 50 MHz 로 시도하므로
+`out/reports_<CONFIG>/` 의 타이밍 리포트에서 WNS ≥ 0 인지 먼저 확인할 것.
+DDR 이 아직 없으므로 큰 프로그램은 highmem 판.
+
+합성에 RAM+스왑 약 40 GB 가 필요하다 (20 GB + 2 GB 에서 OOM 으로 죽음).
 
 ### 다른 구성 (보조)
 
@@ -102,6 +114,8 @@ git format-patch -1 -o ../../patches --start-number <다음 번호>
 올리려면 `config.sh` 의 `CORALNPU_COMMIT` 을 바꾸고 `work/` 를 지운 뒤 `setup`.
 
 ## 현재 패치
+
+`0002-vcu118-matrix-50mhz.patch` — 매트릭스 판 VCU118 타깃, ZVT 플래그 전달, 전 구성 50 MHz.
 
 `0001-vcu118-port.patch` — `fpga/` 에 VCU118 탑(`chip_vcu118`), 125 MHz 클럭 생성기,
 BSCANE2 디버그 전송, 핀 XDC(AMD 보드 파일과 대조 완료), Vivado 훅(VU9P 는 SLR0~2),
