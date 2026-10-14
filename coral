@@ -86,15 +86,28 @@ cmd_setup() {
     git fetch -q origin "${CORALNPU_COMMIT}" 2>/dev/null || git fetch -q origin
     git checkout -q --detach "${CORALNPU_COMMIT}"
   fi
-  local p
+  # Applied patches are recorded in .git/coral-applied (name + sha256): with
+  # stacked patches a reverse-apply check of an early one fails once a later
+  # one has touched the same lines.
+  local p name sum stamp
+  stamp="$(git rev-parse --absolute-git-dir)/coral-applied"
+  touch "${stamp}"
   for p in "${ROOT}"/patches/*.patch; do
     [[ -e "${p}" ]] || continue
-    if git apply --reverse --check "${p}" 2>/dev/null; then
-      echo "  already applied: $(basename "${p}")"
+    name="$(basename "${p}")"
+    sum="$(sha256sum "${p}" | cut -d' ' -f1)"
+    if grep -qx "${name} ${sum}" "${stamp}"; then
+      echo "  already applied: ${name}"
+    elif grep -q "^${name} " "${stamp}"; then
+      die "${name} changed since it was applied; delete work/ and rerun ./coral setup"
+    elif git apply --reverse --check "${p}" 2>/dev/null; then
+      echo "  already applied: ${name}"
+      echo "${name} ${sum}" >> "${stamp}"
     else
-      git apply --check "${p}" || die "patch does not apply: $(basename "${p}")"
+      git apply --check "${p}" || die "patch does not apply: ${name}"
       git apply "${p}"
-      echo "  applied:         $(basename "${p}")"
+      echo "${name} ${sum}" >> "${stamp}"
+      echo "  applied:         ${name}"
     fi
   done
   info "upstream ready at ${WORK} (${CORALNPU_COMMIT:0:8})"
