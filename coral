@@ -302,7 +302,9 @@ cmd_up() {
       sed 's/\r//' "${log}"
     else
       cat "${log}"
-      die "no banner on ${dev}. Wrong CP2105 port? try UART_DEV=/dev/ttyUSB1 ./coral up"
+      local other
+      other="$(ls /dev/ttyUSB* 2>/dev/null | grep -vx "${dev}" | head -n1)"
+      die "no banner on ${dev}. Check LEDs (0 on = clock locked, 1 blinking, 7:4 walking = ROM running); other CP2105 port: UART_DEV=${other:-/dev/ttyUSB0} ./coral up"
     fi
   fi
 
