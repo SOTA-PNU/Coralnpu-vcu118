@@ -1,0 +1,59 @@
+From 40d548c1a1414b9f9b531f3fa1781c98f1e30009 Mon Sep 17 00:00:00 2001
+From: SOTA-PNU <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 18:11:42 +0900
+Subject: [PATCH] fpga: declare rst_main_nqq before gen_autoboot uses it
+
+The reference in gen_autoboot came before the declaration, so it became an
+implicit undriven net. Vivado tied the autoboot FSM's reset, removed the FSM
+(Synth 8-3848), and the core stayed in reset. Also fail the VCU118 build
+right after synthesis if the FSM is missing.
+---
+ fpga/rtl/coralnpu_soc.sv      | 8 +++++++-
+ fpga/vcu118_pre_opt_hooks.tcl | 8 ++++++++
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/fpga/rtl/coralnpu_soc.sv b/fpga/rtl/coralnpu_soc.sv
+index af5b585..0b1df09 100644
+--- a/fpga/rtl/coralnpu_soc.sv
++++ b/fpga/rtl/coralnpu_soc.sv
+@@ -197,6 +197,13 @@ module coralnpu_soc #(
+ 
+   localparam logic [31:0] CsrBaseAddr = (ItcmSizeKBytes == 8 && DtcmSizeKBytes == 32) ? 32'h00030000 : 32'h00200000;
+ 
++  // Declared here, before gen_autoboot uses it. Declared further down (as
++  // upstream had it), the reference below became an implicit, undriven net
++  // gen_autoboot.rst_main_nqq: Vivado held the autoboot FSM in reset, removed
++  // it, and nothing ever released the core from reset (VCU118 bring-up,
++  // Synth 8-3848).
++  logic rst_main_nq, rst_main_nqq;
++
+   if (EnableAutoboot) begin : gen_autoboot
+     autoboot #(
+         .CsrBaseAddr(CsrBaseAddr)
+@@ -498,7 +505,6 @@ module coralnpu_soc #(
+       .scanmode_i   (1'b0)
+   );
+ 
+-  logic rst_main_nq, rst_main_nqq;
+   always_ff @(posedge clk_i or negedge rst_ni) begin
+     if (!rst_ni) begin
+       rst_main_nq  <= 1'b0;
+diff --git a/fpga/vcu118_pre_opt_hooks.tcl b/fpga/vcu118_pre_opt_hooks.tcl
+index 1f447af..be248c8 100644
+--- a/fpga/vcu118_pre_opt_hooks.tcl
++++ b/fpga/vcu118_pre_opt_hooks.tcl
+@@ -35,3 +35,11 @@ catch {
+ catch { set_property MUXF_REMAP 1 [get_cells -hierarchical -filter {REF_NAME =~ MUXF* && NAME =~ *score/lsu*}] }
+ catch { set_property MAX_FANOUT 256 [get_cells -hierarchical -filter {NAME =~ *score/lsu/rs/deqPtr_reg*}] }
+ catch { set_property MAX_FANOUT 256 [get_cells -hierarchical -filter {NAME =~ *div_clk_rst_r1_reg*}] }
++
++# Without the autoboot FSM nothing clears the core's reset CSR: the bitstream
++# looks alive (clock LED, JTAG) but the core never runs. Fail here, right after
++# synthesis, instead of after hours of place and route.
++if {[llength [get_cells -hier -quiet -filter {NAME =~ *gen_autoboot*}]] == 0} {
++    error "VCU118: autoboot FSM missing from the netlist; the core would stay in reset"
++}
++puts "INFO: VCU118 autoboot FSM present"
+-- 
+2.43.0
+
