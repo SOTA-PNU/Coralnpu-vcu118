@@ -1,0 +1,29 @@
+From f1034b9df4f6cfcfd3a0bcd2187592668ef767d4 Mon Sep 17 00:00:00 2001
+From: SOTA-PNU <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 17:52:12 +0900
+Subject: [PATCH] fpga/vcu118: tolerate OpenOCD 0.11 (no riscv set_mem_access)
+
+---
+ fpga/vcu118/gen_openocd_cfg.sh | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/fpga/vcu118/gen_openocd_cfg.sh b/fpga/vcu118/gen_openocd_cfg.sh
+index 5a27b5b..1cac7e4 100755
+--- a/fpga/vcu118/gen_openocd_cfg.sh
++++ b/fpga/vcu118/gen_openocd_cfg.sh
+@@ -72,7 +72,11 @@ riscv set_ir dtmcs  $(hex "${user3}")
+ riscv set_ir dmi    $(hex "${user4}")
+ 
+ # Same memory access mode as the upstream Verilator setup (jtag-sim.cfg).
+-riscv set_mem_access abstract
++# OpenOCD 0.11 (Ubuntu 22.04) lacks set_mem_access; it then falls back to
++# abstract access by itself when the DM has no program buffer.
++if {[catch {riscv set_mem_access abstract}]} {
++    echo "note: this OpenOCD has no 'riscv set_mem_access'; using its default"
++}
+ gdb_breakpoint_override hard
+ 
+ init
+-- 
+2.43.0
+
