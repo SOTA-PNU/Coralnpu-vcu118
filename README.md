@@ -30,6 +30,10 @@ work/ out/ .tools/  (git 제외) 상류 체크아웃 / 산출물 / 내려받은 
 3. hw_server 를 내리고 OpenOCD 로 JTAG(BSCANE2) 에 붙어 `out/vcu118_hello.elf` 를
    ITCM/DTCM 에 올리고 실행한다. UART 에 `Hello from CoralNPU ...` … `DONE`.
 
+빌드 중 VM 이 꺼지면 **다른 bazel/coral build 를 돌리기 전에** `./coral resume` — Bazel 샌드박스에
+남은 Vivado 체크포인트(opt/placed/physopt/routed)에서 이어서 비트스트림을 만든다. 이어서 `./coral sw`
+(hello.elf + OpenOCD 설정), `./coral up`.
+
 내 프로그램을 돌릴 때는 `./coral load my_program.elf`, 콘솔만 볼 때는 `./coral console`.
 
 ## 처음 한 번

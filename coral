@@ -4,6 +4,8 @@
 #   ./coral doctor            check tools, cable and serial port
 #   ./coral setup             fetch upstream CoralNPU (pinned) and apply patches/
 #   ./coral build             bitstream + boot ROM + hello.elf -> out/
+#   ./coral resume            finish an interrupted build from Vivado's last checkpoint
+#   ./coral sw                hello.elf + OpenOCD config only -> out/
 #   ./coral program [x.bit]   load the bitstream (Vivado batch)
 #   ./coral load <x.elf>      load and run a program over JTAG (OpenOCD)
 #   ./coral console           open the USB-UART console
@@ -154,9 +156,66 @@ cmd_build() {
   find "${WORK}/${dir}" \( -name '*utilization*.rpt' -o -name '*timing*.rpt' \) \
     -exec cp -f {} "${OUT}/reports_${CONFIG}/" \; 2>/dev/null || true
 
+  cmd_sw
+}
+
+# Finish an interrupted bitstream build from the newest Vivado checkpoint that
+# Bazel left in its sandbox (e.g. the VM was shut down during route_design).
+# Run it before any other bazel/coral build: Bazel clears old sandboxes.
+cmd_resume() {
+  need_vivado
+  if [[ -z "${XILINXD_LICENSE_FILE:-}" && -f "${HOME}/.Xilinx/Xilinx.lic" ]]; then
+    export XILINXD_LICENSE_FILE="${HOME}/.Xilinx/Xilinx.lic"
+  fi
+  local impl ckpt dcp step d
+  impl="$(find "${HOME}/.cache/bazel" -type d -path "*build.build_chip_vcu118_bitstream_${CONFIG}/*" \
+            -name impl_1 -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2-)"
+  ckpt="${OUT}/ckpt_${CONFIG}"
+  mkdir -p "${ckpt}"
+  dcp=""
+  for step in routed physopt placed opt; do
+    for d in "${ckpt}" "${impl}"; do
+      [[ -n "${d}" && -f "${d}/chip_vcu118_${step}.dcp" ]] && { dcp="${d}/chip_vcu118_${step}.dcp"; break 2; }
+    done
+  done
+  [[ -n "${dcp}" ]] || die "no checkpoint for ${CONFIG} (looked in ${ckpt} and the Bazel sandbox)"
+  [[ "$(dirname "${dcp}")" == "${ckpt}" ]] || cp -f "${dcp}" "${ckpt}/"
+  dcp="${ckpt}/$(basename "${dcp}")"
+  info "resuming ${CONFIG} from ${step}: ${dcp}"
+  {
+    echo "open_checkpoint {${dcp}}"
+    case "${step}" in
+      opt)      echo "place_design"; echo "phys_opt_design"
+                echo "write_checkpoint -force {${ckpt}/chip_vcu118_physopt.dcp}" ;&
+      placed|physopt)
+                echo "route_design"
+                echo "write_checkpoint -force {${ckpt}/chip_vcu118_routed.dcp}" ;;
+    esac
+    echo "report_route_status -file {${ckpt}/route_status.rpt}"
+    echo "report_timing_summary -max_paths 20 -file {${ckpt}/timing_routed.rpt}"
+    echo "report_utilization -file {${ckpt}/utilization_routed.rpt}"
+    echo "write_bitstream -force {${OUT}/chip_vcu118_${CONFIG}.bit}"
+  } > "${ckpt}/resume.tcl"
+  ( cd "${ckpt}" && vivado -mode batch -nojournal -log resume.log -source resume.tcl ) ||
+    die "Vivado failed; see ${ckpt}/resume.log"
+  mkdir -p "${OUT}/reports_${CONFIG}"
+  cp -f "${ckpt}"/*.rpt "${OUT}/reports_${CONFIG}/"
+  grep -m1 -A3 "WNS(ns)" "${ckpt}/timing_routed.rpt" || true
+  info "bitstream: ${OUT}/chip_vcu118_${CONFIG}.bit  (next: ./coral sw, then ./coral up)"
+}
+
+# hello.elf + OpenOCD config only (no Vivado run); also used after a bitstream
+# made outside Bazel, e.g. by re-routing a saved checkpoint.
+cmd_sw() {
+  need_vivado   # gen_openocd_cfg.sh reads the BSDL from the Vivado install
+  ( cmd_setup )
+  local bz elf
+  bz="$(bazel_cmd)"
+  cd "${WORK}"
+  "${bz}" build //fpga:vcu118_hello.elf
+  mkdir -p "${OUT}"
   elf="$(bazel_files //fpga:vcu118_hello.elf | head -n1)"
   cp -f "${WORK}/${elf}" "${OUT}/vcu118_hello.elf"
-
   "${WORK}/fpga/vcu118/gen_openocd_cfg.sh" > "${OUT}/openocd_vcu118.cfg"
   info "outputs:"; ls -la "${OUT}"
 }
@@ -292,6 +351,6 @@ cmd_deploy() {
 # ---------------------------------------------------------------------------
 sub="${1:-}"; shift || true
 case "${sub}" in
-  doctor|setup|build|program|load|console|up|deploy) "cmd_${sub}" "$@" ;;
-  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  doctor|setup|build|resume|sw|program|load|console|up|deploy) "cmd_${sub}" "$@" ;;
+  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
