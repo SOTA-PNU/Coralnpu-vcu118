@@ -15,6 +15,8 @@ udev/           USB 권한 규칙
 work/ out/ .tools/  (git 제외) 상류 체크아웃 / 산출물 / 내려받은 도구
 ```
 
+진행 기록과 측정값은 [docs/LOG.md](docs/LOG.md).
+
 ## 보드를 연결한 뒤
 
 ```bash
@@ -129,7 +131,6 @@ BSCANE2 디버그 전송, 핀 XDC(AMD 보드 파일과 대조 완료), Vivado �
 ## 알려진 한계
 
 - **DDR4 미연결.** `0x8000_0000` 이상 접근 시 버스가 멈춘다 → CPU_RESET 버튼.
-- 아직 실제 Vivado 합성·보드 실행 전. 검증된 것: Verilator lint, 핀 대조, MMCM 계산,
-  OpenOCD 설정 파싱, 패치 적용.
+- 보드 검증 완료 (vector_normal, 50 MHz): 부팅, JTAG 적재, UART, RVV, 행렬곱. 매트릭스 판은 빌드 중.
 - OpenOCD 의 IR 코드는 Vivado 의 BSDL 에서 읽는다(`gen_openocd_cfg.sh`). 첫 실행 때
   `out/openocd_vcu118.cfg` 의 값을 확인해 둘 것.
