@@ -140,6 +140,9 @@ cmd_build() {
     echo "      sudo fallocate -l 32G /swapfile-build && sudo chmod 600 /swapfile-build && sudo mkswap /swapfile-build && sudo swapon /swapfile-build" >&2
   fi
   ( cmd_setup )   # idempotent; picks up patches added since the last build
+  if systemctl is-active --quiet systemd-oomd 2>/dev/null; then
+    echo "WARN: systemd-oomd is running and kills long Vivado runs under swap; run ./tools/setup-host.sh (or: sudo systemctl mask --now systemd-oomd)" >&2
+  fi
   local bz bit_target
   bz="$(bazel_cmd)"
   bit_target="//fpga:build_chip_vcu118_bitstream_${CONFIG}"

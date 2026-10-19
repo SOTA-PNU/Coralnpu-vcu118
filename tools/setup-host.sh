@@ -105,6 +105,16 @@ if [[ ! -e "${libdir}/libtinfo.so.5" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# systemd-oomd (Ubuntu 22.04+) kills the whole terminal scope once memory
+# pressure stays above 50 % for 20 s. Vivado synthesis of the RVV/matrix
+# subsystem lives in swap for hours, so it was killed mid-build (2026-10-19).
+if systemctl list-unit-files systemd-oomd.service >/dev/null 2>&1 &&
+   ! systemctl is-enabled systemd-oomd.service 2>/dev/null | grep -q masked; then
+  sudo systemctl disable --now systemd-oomd.service systemd-oomd.socket 2>/dev/null || true
+  sudo systemctl mask systemd-oomd.service >/dev/null 2>&1 || true
+  echo "disabled systemd-oomd (it kills long Vivado runs that use swap)"
+fi
+
 step "USB permissions for the VCU118 (JTAG 0403:6014, UART 10c4:ea70)"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rules=/etc/udev/rules.d/60-vcu118.rules
