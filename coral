@@ -42,8 +42,10 @@ need_vivado() {
 find_uart() {
   if [[ -n "${UART_DEV}" ]]; then echo "${UART_DEV}"; return; fi
   # CP2105 enumerates as two ttyUSB ports; by-id names contain "CP2105".
+  # On the VCU118 the FPGA UART is interface 1 (if01); the ttyUSB number
+  # changes between boots, the by-id name does not. (measured 2026-10-19)
   local d
-  for d in /dev/serial/by-id/*CP2105*; do
+  for d in /dev/serial/by-id/*CP2105*if01* /dev/serial/by-id/*CP2105*; do
     [[ -e "${d}" ]] && { readlink -f "${d}"; return; }
   done
   find /dev -maxdepth 1 -name "ttyUSB*" 2>/dev/null | sort | head -n1
