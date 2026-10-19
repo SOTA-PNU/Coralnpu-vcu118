@@ -1,0 +1,534 @@
+From e9a7de802a90150460c751840910b42922d59946 Mon Sep 17 00:00:00 2001
+From: SOTA-PNU <noreply@anthropic.com>
+Date: Mon, 19 Oct 2026 19:29:30 +0900
+Subject: [PATCH] fpga/vcu118: drop the ISP (EnableIsp=0), add int8/f32 matmul
+ benchmark
+
+coralnpu_soc gains EnableIsp (default 1, Nexus unchanged). The VCU118 has no
+camera; removing the ISP frees area and routing for the matrix variant and
+removes the only hold violations (ISP async-reset removal paths).
+---
+ fpga/BUILD                    |   6 +
+ fpga/rtl/chip_vcu118.sv       |   1 +
+ fpga/rtl/coralnpu_soc.sv      | 288 ++++++++++++++++++++--------------
+ fpga/sw/vcu118/matmul_bench.c | 173 ++++++++++++++++++++
+ 4 files changed, 352 insertions(+), 116 deletions(-)
+ create mode 100644 fpga/sw/vcu118/matmul_bench.c
+
+diff --git a/fpga/BUILD b/fpga/BUILD
+index cbdb924..5a85795 100644
+--- a/fpga/BUILD
++++ b/fpga/BUILD
+@@ -975,6 +975,12 @@ coralnpu_v2_binary(
+     deps = [":uart"],
+ )
+ 
++coralnpu_v2_binary(
++    name = "vcu118_matmul_bench",
++    srcs = ["sw/vcu118/matmul_bench.c"],
++    deps = [":uart"],
++)
++
+ VCU118_VIVADO_HOOKS = [
+     "vcu118_setup_hooks.tcl",
+     "vcu118_pre_opt_hooks.tcl",
+diff --git a/fpga/rtl/chip_vcu118.sv b/fpga/rtl/chip_vcu118.sv
+index 6fc8200..1914fc2 100644
+--- a/fpga/rtl/chip_vcu118.sv
++++ b/fpga/rtl/chip_vcu118.sv
+@@ -141,6 +141,7 @@ module chip_vcu118 #(
+       .IspClockFrequencyMhz (IspClockFrequencyMhz),
+       .SpimClockFrequencyMhz(SpimClockFrequencyMhz),
+       .EnableAutoboot       (EnableAutoboot),
++      .EnableIsp            (0),  // no camera on the VCU118
+       .ItcmSizeKBytes       (ItcmSizeKBytes),
+       .DtcmSizeKBytes       (DtcmSizeKBytes),
+       .AddrWidth            (AddrWidth)
+diff --git a/fpga/rtl/coralnpu_soc.sv b/fpga/rtl/coralnpu_soc.sv
+index 0b1df09..055b925 100644
+--- a/fpga/rtl/coralnpu_soc.sv
++++ b/fpga/rtl/coralnpu_soc.sv
+@@ -18,6 +18,7 @@ module coralnpu_soc #(
+     parameter int IspClockFrequencyMhz = 10,
+     parameter int SpimClockFrequencyMhz = 100,
+     parameter int EnableAutoboot = 0,
++    parameter int EnableIsp = 1,
+     parameter int ItcmSizeKBytes = 8,
+     parameter int DtcmSizeKBytes = 32,
+     parameter int AddrWidth = 32
+@@ -388,122 +389,177 @@ module coralnpu_soc #(
+ 
+   logic intr_mi, intr_isp;
+ 
+-  isp_wrapper u_isp (
+-      .clk_i     (clk_isp_i),
+-      .clk_core_i(clk_isp_i),
+-      .clk_axi_i (clk_isp_i),
+-      .rst_ni    (rst_ni),
+-
+-      // TLUL Control (TLUL Control Slave (AHB internally))
+-      .tl_i(isp_tl_h2d),
+-      .tl_o(isp_tl_d2h),
+-
+-      // AXI M1 (Master isp main path)
+-      .axi_m1_awvalid (isp_m1_awvalid),
+-      .axi_m1_awready (isp_m1_awready),
+-      .axi_m1_awaddr  (isp_m1_awaddr),
+-      .axi_m1_awid    (isp_m1_awid),
+-      .axi_m1_awlen   (isp_m1_awlen),
+-      .axi_m1_awsize  (isp_m1_awsize),
+-      .axi_m1_awburst (isp_m1_awburst),
+-      .axi_m1_awlock  (isp_m1_awlock),
+-      .axi_m1_awcache (isp_m1_awcache),
+-      .axi_m1_awprot  (isp_m1_awprot),
+-      .axi_m1_awqos   (isp_m1_awqos),
+-      .axi_m1_awregion(isp_m1_awregion),
+-      .axi_m1_wvalid  (isp_m1_wvalid),
+-      .axi_m1_wready  (isp_m1_wready),
+-      .axi_m1_wdata   (isp_m1_wdata),
+-      .axi_m1_wstrb   (isp_m1_wstrb),
+-      .axi_m1_wlast   (isp_m1_wlast),
+-      .axi_m1_wid     (isp_m1_wid),
+-      .axi_m1_bvalid  (isp_m1_bvalid),
+-      .axi_m1_bready  (isp_m1_bready),
+-      .axi_m1_bresp   (isp_m1_bresp),
+-      .axi_m1_bid     (isp_m1_bid),
+-      .axi_m1_arready (isp_m1_arready),
+-      .axi_m1_arvalid (isp_m1_arvalid),
+-      .axi_m1_araddr  (isp_m1_araddr),
+-      .axi_m1_arid    (isp_m1_arid),
+-      .axi_m1_arlen   (isp_m1_arlen),
+-      .axi_m1_arsize  (isp_m1_arsize),
+-      .axi_m1_arburst (isp_m1_arburst),
+-      .axi_m1_arlock  (isp_m1_arlock),
+-      .axi_m1_arcache (isp_m1_arcache),
+-      .axi_m1_arprot  (isp_m1_arprot),
+-      .axi_m1_arqos   (isp_m1_arqos),
+-      .axi_m1_arregion(isp_m1_arregion),
+-      .axi_m1_rvalid  (isp_m1_rvalid),
+-      .axi_m1_rready  (isp_m1_rready),
+-      .axi_m1_rdata   (isp_m1_rdata),
+-      .axi_m1_rresp   (isp_m1_rresp),
+-      .axi_m1_rid     (isp_m1_rid),
+-      .axi_m1_rlast   (isp_m1_rlast),
+-
+-      // AXI M2 (Master isp self path)
+-      .axi_m2_awvalid (isp_m2_awvalid),
+-      .axi_m2_awready (isp_m2_awready),
+-      .axi_m2_awaddr  (isp_m2_awaddr),
+-      .axi_m2_awid    (isp_m2_awid),
+-      .axi_m2_awlen   (isp_m2_awlen),
+-      .axi_m2_awsize  (isp_m2_awsize),
+-      .axi_m2_awburst (isp_m2_awburst),
+-      .axi_m2_awlock  (isp_m2_awlock),
+-      .axi_m2_awcache (isp_m2_awcache),
+-      .axi_m2_awprot  (isp_m2_awprot),
+-      .axi_m2_awqos   (isp_m2_awqos),
+-      .axi_m2_awregion(isp_m2_awregion),
+-      .axi_m2_wvalid  (isp_m2_wvalid),
+-      .axi_m2_wready  (isp_m2_wready),
+-      .axi_m2_wdata   (isp_m2_wdata),
+-      .axi_m2_wstrb   (isp_m2_wstrb),
+-      .axi_m2_wlast   (isp_m2_wlast),
+-      .axi_m2_wid     (isp_m2_wid),
+-      .axi_m2_bvalid  (isp_m2_bvalid),
+-      .axi_m2_bready  (isp_m2_bready),
+-      .axi_m2_bresp   (isp_m2_bresp),
+-      .axi_m2_bid     (isp_m2_bid),
+-      .axi_m2_arready (1'b1),             // Unused by ISP wrapper
+-      .axi_m2_arvalid (),
+-      .axi_m2_araddr  (),
+-      .axi_m2_arid    (),
+-      .axi_m2_arlen   (),
+-      .axi_m2_arsize  (),
+-      .axi_m2_arburst (),
+-      .axi_m2_arlock  (),
+-      .axi_m2_arcache (),
+-      .axi_m2_arprot  (),
+-      .axi_m2_arqos   (),
+-      .axi_m2_arregion(),
+-      .axi_m2_rvalid  (1'b0),
+-      .axi_m2_rready  (),
+-      .axi_m2_rdata   (64'b0),
+-      .axi_m2_rresp   (2'b0),
+-      .axi_m2_rid     (4'b0),
+-      .axi_m2_rlast   (1'b0),
+-
+-      // Sensor Interface
+-      .cio_s_pclk_i(ISP_DVP_PCLK),
+-      .cio_s_data_i({
+-        ISP_DVP_D7,
+-        ISP_DVP_D6,
+-        ISP_DVP_D5,
+-        ISP_DVP_D4,
+-        ISP_DVP_D3,
+-        ISP_DVP_D2,
+-        ISP_DVP_D1,
+-        ISP_DVP_D0
+-      }),
+-      .cio_s_hsync_i(ISP_DVP_HSYNC),
+-      .cio_s_vsync_i(ISP_DVP_VSYNC),
+-
+-      // Interrupts
+-      .intr_mi_o (intr_mi),
+-      .intr_isp_o(intr_isp),
+-
+-      .disable_isp_i(1'b0),
+-      .scanmode_i   (1'b0)
+-  );
++  if (EnableIsp) begin : gen_isp
++    isp_wrapper u_isp (
++        .clk_i     (clk_isp_i),
++        .clk_core_i(clk_isp_i),
++        .clk_axi_i (clk_isp_i),
++        .rst_ni    (rst_ni),
++
++        // TLUL Control (TLUL Control Slave (AHB internally))
++        .tl_i(isp_tl_h2d),
++        .tl_o(isp_tl_d2h),
++
++        // AXI M1 (Master isp main path)
++        .axi_m1_awvalid (isp_m1_awvalid),
++        .axi_m1_awready (isp_m1_awready),
++        .axi_m1_awaddr  (isp_m1_awaddr),
++        .axi_m1_awid    (isp_m1_awid),
++        .axi_m1_awlen   (isp_m1_awlen),
++        .axi_m1_awsize  (isp_m1_awsize),
++        .axi_m1_awburst (isp_m1_awburst),
++        .axi_m1_awlock  (isp_m1_awlock),
++        .axi_m1_awcache (isp_m1_awcache),
++        .axi_m1_awprot  (isp_m1_awprot),
++        .axi_m1_awqos   (isp_m1_awqos),
++        .axi_m1_awregion(isp_m1_awregion),
++        .axi_m1_wvalid  (isp_m1_wvalid),
++        .axi_m1_wready  (isp_m1_wready),
++        .axi_m1_wdata   (isp_m1_wdata),
++        .axi_m1_wstrb   (isp_m1_wstrb),
++        .axi_m1_wlast   (isp_m1_wlast),
++        .axi_m1_wid     (isp_m1_wid),
++        .axi_m1_bvalid  (isp_m1_bvalid),
++        .axi_m1_bready  (isp_m1_bready),
++        .axi_m1_bresp   (isp_m1_bresp),
++        .axi_m1_bid     (isp_m1_bid),
++        .axi_m1_arready (isp_m1_arready),
++        .axi_m1_arvalid (isp_m1_arvalid),
++        .axi_m1_araddr  (isp_m1_araddr),
++        .axi_m1_arid    (isp_m1_arid),
++        .axi_m1_arlen   (isp_m1_arlen),
++        .axi_m1_arsize  (isp_m1_arsize),
++        .axi_m1_arburst (isp_m1_arburst),
++        .axi_m1_arlock  (isp_m1_arlock),
++        .axi_m1_arcache (isp_m1_arcache),
++        .axi_m1_arprot  (isp_m1_arprot),
++        .axi_m1_arqos   (isp_m1_arqos),
++        .axi_m1_arregion(isp_m1_arregion),
++        .axi_m1_rvalid  (isp_m1_rvalid),
++        .axi_m1_rready  (isp_m1_rready),
++        .axi_m1_rdata   (isp_m1_rdata),
++        .axi_m1_rresp   (isp_m1_rresp),
++        .axi_m1_rid     (isp_m1_rid),
++        .axi_m1_rlast   (isp_m1_rlast),
++
++        // AXI M2 (Master isp self path)
++        .axi_m2_awvalid (isp_m2_awvalid),
++        .axi_m2_awready (isp_m2_awready),
++        .axi_m2_awaddr  (isp_m2_awaddr),
++        .axi_m2_awid    (isp_m2_awid),
++        .axi_m2_awlen   (isp_m2_awlen),
++        .axi_m2_awsize  (isp_m2_awsize),
++        .axi_m2_awburst (isp_m2_awburst),
++        .axi_m2_awlock  (isp_m2_awlock),
++        .axi_m2_awcache (isp_m2_awcache),
++        .axi_m2_awprot  (isp_m2_awprot),
++        .axi_m2_awqos   (isp_m2_awqos),
++        .axi_m2_awregion(isp_m2_awregion),
++        .axi_m2_wvalid  (isp_m2_wvalid),
++        .axi_m2_wready  (isp_m2_wready),
++        .axi_m2_wdata   (isp_m2_wdata),
++        .axi_m2_wstrb   (isp_m2_wstrb),
++        .axi_m2_wlast   (isp_m2_wlast),
++        .axi_m2_wid     (isp_m2_wid),
++        .axi_m2_bvalid  (isp_m2_bvalid),
++        .axi_m2_bready  (isp_m2_bready),
++        .axi_m2_bresp   (isp_m2_bresp),
++        .axi_m2_bid     (isp_m2_bid),
++        .axi_m2_arready (1'b1),             // Unused by ISP wrapper
++        .axi_m2_arvalid (),
++        .axi_m2_araddr  (),
++        .axi_m2_arid    (),
++        .axi_m2_arlen   (),
++        .axi_m2_arsize  (),
++        .axi_m2_arburst (),
++        .axi_m2_arlock  (),
++        .axi_m2_arcache (),
++        .axi_m2_arprot  (),
++        .axi_m2_arqos   (),
++        .axi_m2_arregion(),
++        .axi_m2_rvalid  (1'b0),
++        .axi_m2_rready  (),
++        .axi_m2_rdata   (64'b0),
++        .axi_m2_rresp   (2'b0),
++        .axi_m2_rid     (4'b0),
++        .axi_m2_rlast   (1'b0),
++
++        // Sensor Interface
++        .cio_s_pclk_i(ISP_DVP_PCLK),
++        .cio_s_data_i({
++          ISP_DVP_D7,
++          ISP_DVP_D6,
++          ISP_DVP_D5,
++          ISP_DVP_D4,
++          ISP_DVP_D3,
++          ISP_DVP_D2,
++          ISP_DVP_D1,
++          ISP_DVP_D0
++        }),
++        .cio_s_hsync_i(ISP_DVP_HSYNC),
++        .cio_s_vsync_i(ISP_DVP_VSYNC),
++
++        // Interrupts
++        .intr_mi_o (intr_mi),
++        .intr_isp_o(intr_isp),
++
++        .disable_isp_i(1'b0),
++        .scanmode_i   (1'b0)
++    );
++  end else begin : gen_no_isp
++    // No camera on this board: drop the ISP. Its AXI masters stay idle and
++    // its TL-UL control port never answers (like ddr4_stub), so software
++    // must not touch ispyocto_ctrl.
++    assign isp_m1_awvalid = '0;
++    assign isp_m1_awaddr = '0;
++    assign isp_m1_awid = '0;
++    assign isp_m1_awlen = '0;
++    assign isp_m1_awsize = '0;
++    assign isp_m1_awburst = '0;
++    assign isp_m1_awlock = '0;
++    assign isp_m1_awcache = '0;
++    assign isp_m1_awprot = '0;
++    assign isp_m1_awqos = '0;
++    assign isp_m1_awregion = '0;
++    assign isp_m1_wvalid = '0;
++    assign isp_m1_wdata = '0;
++    assign isp_m1_wstrb = '0;
++    assign isp_m1_wlast = '0;
++    assign isp_m1_wid = '0;
++    assign isp_m1_bready = 1'b1;
++    assign isp_m1_arvalid = '0;
++    assign isp_m1_araddr = '0;
++    assign isp_m1_arid = '0;
++    assign isp_m1_arlen = '0;
++    assign isp_m1_arsize = '0;
++    assign isp_m1_arburst = '0;
++    assign isp_m1_arlock = '0;
++    assign isp_m1_arcache = '0;
++    assign isp_m1_arprot = '0;
++    assign isp_m1_arqos = '0;
++    assign isp_m1_arregion = '0;
++    assign isp_m1_rready = 1'b1;
++    assign isp_m2_awvalid = '0;
++    assign isp_m2_awaddr = '0;
++    assign isp_m2_awid = '0;
++    assign isp_m2_awlen = '0;
++    assign isp_m2_awsize = '0;
++    assign isp_m2_awburst = '0;
++    assign isp_m2_awlock = '0;
++    assign isp_m2_awcache = '0;
++    assign isp_m2_awprot = '0;
++    assign isp_m2_awqos = '0;
++    assign isp_m2_awregion = '0;
++    assign isp_m2_wvalid = '0;
++    assign isp_m2_wdata = '0;
++    assign isp_m2_wstrb = '0;
++    assign isp_m2_wlast = '0;
++    assign isp_m2_wid = '0;
++    assign isp_m2_bready = 1'b1;
++    assign isp_tl_d2h = '0;
++    assign intr_mi    = 1'b0;
++    assign intr_isp   = 1'b0;
++  end
+ 
+   always_ff @(posedge clk_i or negedge rst_ni) begin
+     if (!rst_ni) begin
+diff --git a/fpga/sw/vcu118/matmul_bench.c b/fpga/sw/vcu118/matmul_bench.c
+new file mode 100644
+index 0000000..b0b1a08
+--- /dev/null
++++ b/fpga/sw/vcu118/matmul_bench.c
+@@ -0,0 +1,173 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// VCU118 matmul benchmark: C = A x B, row-major, all operands in DTCM.
++//   int8 x int8 -> int32 (the usual quantized-NN inner loop)
++//   f32  x f32  -> f32
++// Each runs with RVV (broadcast A[i][k], vector of B[k][j..], multiply-add)
++// and in scalar C. Results are compared; cycles come from mcycle.
++// Last lines: "MATMUL PASS"/"MATMUL FAIL", then "DONE".
++
++#include <riscv_vector.h>
++#include <stdint.h>
++
++#include "fpga/sw/uart.h"
++
++#define M 32
++#define K 32
++#define N 32
++#define FM 16
++#define FK 16
++#define FN 16
++
++static int8_t a8[M][K], b8[K][N];
++static int32_t c_v[M][N], c_s[M][N];
++static float af[FM][FK], bf[FK][FN], cf_v[FM][FN], cf_s[FM][FN];
++
++static inline uint32_t cycles(void) {
++  uint32_t c;
++  __asm__ volatile("csrr %0, mcycle" : "=r"(c));
++  return c;
++}
++
++static void put_dec(uint32_t v) {
++  char buf[11];
++  int n = 0;
++  do {
++    buf[n++] = (char)('0' + v % 10);
++    v /= 10;
++  } while (v);
++  while (n) uart_putc(buf[--n]);
++}
++
++// x100 fixed point, e.g. 1234 -> "12.34"
++static void put_fix2(uint32_t v100) {
++  put_dec(v100 / 100);
++  uart_putc('.');
++  uart_putc((char)('0' + (v100 / 10) % 10));
++  uart_putc((char)('0' + v100 % 10));
++}
++
++static void report(const char* name, int ok, uint32_t macs, uint32_t vc,
++                   uint32_t sc) {
++  uart_puts("  ");
++  uart_puts(name);
++  uart_puts(ok ? "  ok" : "  FAIL");
++  uart_puts("  vector ");
++  put_dec(vc);
++  uart_puts(" cyc (");
++  put_fix2(macs * 100u / vc);
++  uart_puts(" MAC/cyc, ");
++  put_fix2(macs * 5000u / vc);  // 50 MHz
++  uart_puts(" MMAC/s)  scalar ");
++  put_dec(sc);
++  uart_puts(" cyc  speedup ");
++  put_fix2(sc * 100u / vc);
++  uart_puts("x\r\n");
++}
++
++static void mm_i8_rvv(void) {
++  for (int i = 0; i < M; ++i) {
++    for (size_t j = 0, n = N; n > 0;) {
++      size_t vl = __riscv_vsetvl_e32m4(n);
++      vint32m4_t acc = __riscv_vmv_v_x_i32m4(0, vl);
++      for (int k = 0; k < K; ++k) {
++        vint8m1_t b = __riscv_vle8_v_i8m1(&b8[k][j], vl);
++        vint32m4_t bw = __riscv_vsext_vf4_i32m4(b, vl);
++        acc = __riscv_vmacc_vx_i32m4(acc, a8[i][k], bw, vl);
++      }
++      __riscv_vse32_v_i32m4(&c_v[i][j], acc, vl);
++      n -= vl;
++      j += vl;
++    }
++  }
++}
++
++static void mm_i8_scalar(void) {
++  for (int i = 0; i < M; ++i)
++    for (int j = 0; j < N; ++j) {
++      int32_t acc = 0;
++      for (int k = 0; k < K; ++k) acc += (int32_t)a8[i][k] * b8[k][j];
++      c_s[i][j] = acc;
++    }
++}
++
++static void mm_f32_rvv(void) {
++  for (int i = 0; i < FM; ++i) {
++    for (size_t j = 0, n = FN; n > 0;) {
++      size_t vl = __riscv_vsetvl_e32m4(n);
++      vfloat32m4_t acc = __riscv_vfmv_v_f_f32m4(0.0f, vl);
++      for (int k = 0; k < FK; ++k) {
++        vfloat32m4_t b = __riscv_vle32_v_f32m4(&bf[k][j], vl);
++        acc = __riscv_vfmacc_vf_f32m4(acc, af[i][k], b, vl);
++      }
++      __riscv_vse32_v_f32m4(&cf_v[i][j], acc, vl);
++      n -= vl;
++      j += vl;
++    }
++  }
++}
++
++static void mm_f32_scalar(void) {
++  for (int i = 0; i < FM; ++i)
++    for (int j = 0; j < FN; ++j) {
++      float acc = 0.0f;
++      for (int k = 0; k < FK; ++k) acc += af[i][k] * bf[k][j];
++      cf_s[i][j] = acc;
++    }
++}
++
++int main(void) {
++  uart_init();
++  uart_puts("Matmul benchmark on CoralNPU / VCU118 (50 MHz)\r\n");
++
++  for (int i = 0; i < M; ++i)
++    for (int k = 0; k < K; ++k) a8[i][k] = (int8_t)((i * 7 + k * 13) % 255 - 127);
++  for (int k = 0; k < K; ++k)
++    for (int j = 0; j < N; ++j) b8[k][j] = (int8_t)((k * 11 + j * 5) % 255 - 127);
++  // quarter steps: every product and partial sum is exact in f32
++  for (int i = 0; i < FM; ++i)
++    for (int k = 0; k < FK; ++k) af[i][k] = (float)((i + 2 * k) % 9 - 4) * 0.25f;
++  for (int k = 0; k < FK; ++k)
++    for (int j = 0; j < FN; ++j) bf[k][j] = (float)((3 * k + j) % 7 - 3) * 0.5f;
++
++  int all_ok = 1, ok;
++  uint32_t t0, t1, t2;
++
++  t0 = cycles();
++  mm_i8_rvv();
++  t1 = cycles();
++  mm_i8_scalar();
++  t2 = cycles();
++  ok = 1;
++  for (int i = 0; i < M; ++i)
++    for (int j = 0; j < N; ++j) ok &= (c_v[i][j] == c_s[i][j]);
++  report("int8 32x32x32", ok, M * N * K, t1 - t0, t2 - t1);
++  all_ok &= ok;
++
++  t0 = cycles();
++  mm_f32_rvv();
++  t1 = cycles();
++  mm_f32_scalar();
++  t2 = cycles();
++  ok = 1;
++  for (int i = 0; i < FM; ++i)
++    for (int j = 0; j < FN; ++j) ok &= (cf_v[i][j] == cf_s[i][j]);
++  report("f32  16x16x16", ok, FM * FN * FK, t1 - t0, t2 - t1);
++  all_ok &= ok;
++
++  uart_puts(all_ok ? "MATMUL PASS\r\n" : "MATMUL FAIL\r\n");
++  uart_puts("DONE\r\n");
++  return 0;
++}
+-- 
+2.43.0
+

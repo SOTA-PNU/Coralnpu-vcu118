@@ -5,7 +5,7 @@
 #   ./coral setup             fetch upstream CoralNPU (pinned) and apply patches/
 #   ./coral build             bitstream + boot ROM + hello.elf -> out/
 #   ./coral resume            finish an interrupted build from Vivado's last checkpoint
-#   ./coral sw                hello.elf, rvv_test.elf + OpenOCD config -> out/
+#   ./coral sw                hello, rvv_test, matmul_bench ELFs + OpenOCD config -> out/
 #   ./coral run <x.elf>       load over JTAG, run, print the console output
 #   ./coral program [x.bit]   load the bitstream (Vivado batch)
 #   ./coral load <x.elf>      load and run a program over JTAG (OpenOCD)
@@ -213,7 +213,7 @@ cmd_resume() {
 # hello.elf, rvv_test.elf + OpenOCD config only (no Vivado run). Uses its own
 # Bazel output base, so it works while a bitstream build holds the main one.
 SW_OUTPUT_BASE="${HOME}/.cache/coral-sw-bazel"
-SW_TARGETS=(vcu118_hello vcu118_rvv_test)
+SW_TARGETS=(vcu118_hello vcu118_rvv_test vcu118_matmul_bench)
 cmd_sw() {
   need_vivado   # gen_openocd_cfg.sh reads the BSDL from the Vivado install
   ( cmd_setup )
@@ -292,11 +292,22 @@ cmd_load() {
   cfg="$(openocd_cfg)"
   entry="$(readelf -h "${elf}" | awk '/Entry point address/ {print $4}')"
   info "loading ${elf} (entry ${entry})"
-  openocd -f "${cfg}" \
-    -c "load_image ${elf}" \
-    -c "verify_image ${elf}" \
-    -c "resume ${entry}" \
-    -c "shutdown"
+  # "reset halt" (ndmreset + haltreq) first: a program that returned from
+  # main ends in mpause, which sets a sticky halted flag that only a core
+  # reset clears; a plain resume then does nothing (seen 2026-10-19).
+  if ! openocd -f "${cfg}" \
+      -c "reset halt" \
+      -c "load_image ${elf}" \
+      -c "verify_image ${elf}" \
+      -c "resume ${entry}" \
+      -c "shutdown"; then
+    echo "WARN: load with reset failed; retrying without reset" >&2
+    openocd -f "${cfg}" \
+      -c "load_image ${elf}" \
+      -c "verify_image ${elf}" \
+      -c "resume ${entry}" \
+      -c "shutdown"
+  fi
 }
 
 # ---------------------------------------------------------------------------
