@@ -1,0 +1,209 @@
+From 99de99243ae51bef88a5b3ddbbd21bbc158cc8af Mon Sep 17 00:00:00 2001
+From: SOTA-PNU <noreply@anthropic.com>
+Date: Mon, 19 Oct 2026 19:03:05 +0900
+Subject: [PATCH] fpga/vcu118: RVV smoke test (vadd, vmacc, vredsum, vfmacc vs
+ scalar)
+
+---
+ fpga/BUILD                |   6 ++
+ fpga/sw/vcu118/rvv_test.c | 171 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 177 insertions(+)
+ create mode 100644 fpga/sw/vcu118/rvv_test.c
+
+diff --git a/fpga/BUILD b/fpga/BUILD
+index 83f1939..cbdb924 100644
+--- a/fpga/BUILD
++++ b/fpga/BUILD
+@@ -969,6 +969,12 @@ coralnpu_v2_binary(
+     deps = [":uart"],
+ )
+ 
++coralnpu_v2_binary(
++    name = "vcu118_rvv_test",
++    srcs = ["sw/vcu118/rvv_test.c"],
++    deps = [":uart"],
++)
++
+ VCU118_VIVADO_HOOKS = [
+     "vcu118_setup_hooks.tcl",
+     "vcu118_pre_opt_hooks.tcl",
+diff --git a/fpga/sw/vcu118/rvv_test.c b/fpga/sw/vcu118/rvv_test.c
+new file mode 100644
+index 0000000..f850a8e
+--- /dev/null
++++ b/fpga/sw/vcu118/rvv_test.c
+@@ -0,0 +1,171 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// VCU118 vector (RVV) smoke test, loaded over JTAG like hello.c.
++// Each kernel runs once with RVV intrinsics and once in plain scalar C, the
++// results are compared, and the cycle counts (mcycle) of both are printed.
++// The last line is "RVV PASS" or "RVV FAIL".
++
++#include <riscv_vector.h>
++#include <stdint.h>
++
++#include "fpga/sw/uart.h"
++
++#define N 259  // not a multiple of VLMAX: exercises the vsetvl tail
++
++static uint32_t a_u[N], b_u[N], v_u[N], s_u[N];
++static int32_t a_i[N], b_i[N], v_i[N], s_i[N];
++static float a_f[N], b_f[N], v_f[N], s_f[N];
++
++static inline uint32_t cycles(void) {
++  uint32_t c;
++  __asm__ volatile("csrr %0, mcycle" : "=r"(c));
++  return c;
++}
++
++static void put_line(const char* name, int ok, uint32_t vec_cyc,
++                     uint32_t sca_cyc) {
++  uart_puts("  ");
++  uart_puts(name);
++  uart_puts(ok ? "  ok    vector cycles=0x" : "  FAIL  vector cycles=0x");
++  uart_puthex32(vec_cyc);
++  uart_puts("  scalar cycles=0x");
++  uart_puthex32(sca_cyc);
++  uart_puts("\r\n");
++}
++
++// u32 add, LMUL=1
++static void vadd_u32(void) {
++  for (size_t n = N, i = 0; n > 0;) {
++    size_t vl = __riscv_vsetvl_e32m1(n);
++    vuint32m1_t x = __riscv_vle32_v_u32m1(&a_u[i], vl);
++    vuint32m1_t y = __riscv_vle32_v_u32m1(&b_u[i], vl);
++    __riscv_vse32_v_u32m1(&v_u[i], __riscv_vadd_vv_u32m1(x, y, vl), vl);
++    n -= vl;
++    i += vl;
++  }
++}
++
++// i32 multiply-add, LMUL=4
++static void vmacc_i32(void) {
++  for (size_t n = N, i = 0; n > 0;) {
++    size_t vl = __riscv_vsetvl_e32m4(n);
++    vint32m4_t x = __riscv_vle32_v_i32m4(&a_i[i], vl);
++    vint32m4_t y = __riscv_vle32_v_i32m4(&b_i[i], vl);
++    vint32m4_t acc = __riscv_vmv_v_x_i32m4(7, vl);
++    acc = __riscv_vmacc_vv_i32m4(acc, x, y, vl);
++    __riscv_vse32_v_i32m4(&v_i[i], acc, vl);
++    n -= vl;
++    i += vl;
++  }
++}
++
++// i32 sum reduction, LMUL=8
++static int32_t vredsum_i32(void) {
++  vint32m1_t sum = __riscv_vmv_s_x_i32m1(0, 1);
++  for (size_t n = N, i = 0; n > 0;) {
++    size_t vl = __riscv_vsetvl_e32m8(n);
++    vint32m8_t x = __riscv_vle32_v_i32m8(&a_i[i], vl);
++    sum = __riscv_vredsum_vs_i32m8_i32m1(x, sum, vl);
++    n -= vl;
++    i += vl;
++  }
++  return __riscv_vmv_x_s_i32m1_i32(sum);
++}
++
++// f32 fused multiply-add (Zve32f), LMUL=2
++static void vfmacc_f32(void) {
++  for (size_t n = N, i = 0; n > 0;) {
++    size_t vl = __riscv_vsetvl_e32m2(n);
++    vfloat32m2_t x = __riscv_vle32_v_f32m2(&a_f[i], vl);
++    vfloat32m2_t y = __riscv_vle32_v_f32m2(&b_f[i], vl);
++    vfloat32m2_t acc = __riscv_vfmv_v_f_f32m2(0.5f, vl);
++    acc = __riscv_vfmacc_vv_f32m2(acc, x, y, vl);
++    __riscv_vse32_v_f32m2(&v_f[i], acc, vl);
++    n -= vl;
++    i += vl;
++  }
++}
++
++int main(void) {
++  uart_init();
++  uart_puts("RVV test on CoralNPU / VCU118\r\n");
++
++  size_t vlmax = __riscv_vsetvlmax_e32m1();
++  uart_puts("  VLMAX(e32,m1) = 0x");
++  uart_puthex32((uint32_t)vlmax);
++  uart_puts("  (VLEN bits = 0x");
++  uart_puthex32((uint32_t)(vlmax * 32));
++  uart_puts(")\r\n");
++
++  for (int i = 0; i < N; ++i) {
++    a_u[i] = 0x01000000u * (uint32_t)(i & 0xff) + (uint32_t)i * 2654435761u;
++    b_u[i] = (uint32_t)i * 40503u + 17u;
++    a_i[i] = (i * 37) % 201 - 100;
++    b_i[i] = (i * 53) % 97 - 48;
++    a_f[i] = (float)(i % 13) * 0.25f - 1.5f;
++    b_f[i] = (float)(i % 7) * 0.5f + 0.125f;
++  }
++
++  int all_ok = 1;
++  uint32_t t0, t1, t2;
++
++  // add
++  t0 = cycles();
++  vadd_u32();
++  t1 = cycles();
++  for (int i = 0; i < N; ++i) s_u[i] = a_u[i] + b_u[i];
++  t2 = cycles();
++  int ok = 1;
++  for (int i = 0; i < N; ++i) ok &= (v_u[i] == s_u[i]);
++  put_line("vadd.vv   u32 m1", ok, t1 - t0, t2 - t1);
++  all_ok &= ok;
++
++  // macc
++  t0 = cycles();
++  vmacc_i32();
++  t1 = cycles();
++  for (int i = 0; i < N; ++i) s_i[i] = 7 + a_i[i] * b_i[i];
++  t2 = cycles();
++  ok = 1;
++  for (int i = 0; i < N; ++i) ok &= (v_i[i] == s_i[i]);
++  put_line("vmacc.vv  i32 m4", ok, t1 - t0, t2 - t1);
++  all_ok &= ok;
++
++  // reduction
++  t0 = cycles();
++  int32_t vsum = vredsum_i32();
++  t1 = cycles();
++  int32_t ssum = 0;
++  for (int i = 0; i < N; ++i) ssum += a_i[i];
++  t2 = cycles();
++  ok = (vsum == ssum);
++  put_line("vredsum   i32 m8", ok, t1 - t0, t2 - t1);
++  all_ok &= ok;
++
++  // float fma: products of quarter/eighth steps are exact in f32
++  t0 = cycles();
++  vfmacc_f32();
++  t1 = cycles();
++  for (int i = 0; i < N; ++i) s_f[i] = 0.5f + a_f[i] * b_f[i];
++  t2 = cycles();
++  ok = 1;
++  for (int i = 0; i < N; ++i) ok &= (v_f[i] == s_f[i]);
++  put_line("vfmacc.vv f32 m2", ok, t1 - t0, t2 - t1);
++  all_ok &= ok;
++
++  uart_puts(all_ok ? "RVV PASS\r\n" : "RVV FAIL\r\n");
++  uart_puts("DONE\r\n");
++  return 0;
++}
+-- 
+2.43.0
+

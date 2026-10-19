@@ -5,7 +5,8 @@
 #   ./coral setup             fetch upstream CoralNPU (pinned) and apply patches/
 #   ./coral build             bitstream + boot ROM + hello.elf -> out/
 #   ./coral resume            finish an interrupted build from Vivado's last checkpoint
-#   ./coral sw                hello.elf + OpenOCD config only -> out/
+#   ./coral sw                hello.elf, rvv_test.elf + OpenOCD config -> out/
+#   ./coral run <x.elf>       load over JTAG, run, print the console output
 #   ./coral program [x.bit]   load the bitstream (Vivado batch)
 #   ./coral load <x.elf>      load and run a program over JTAG (OpenOCD)
 #   ./coral console           open the USB-UART console
@@ -148,7 +149,7 @@ cmd_build() {
   bit_target="//fpga:build_chip_vcu118_bitstream_${CONFIG}"
   cd "${WORK}"
   info "building ${bit_target} (Vivado synthesis + P&R: expect an hour or more)"
-  "${bz}" build "${bit_target}" //fpga:vcu118_hello.elf
+  "${bz}" build "${bit_target}"
 
   mkdir -p "${OUT}"
   local dir bit elf
@@ -209,20 +210,50 @@ cmd_resume() {
   info "bitstream: ${OUT}/chip_vcu118_${CONFIG}.bit  (next: ./coral sw, then ./coral up)"
 }
 
-# hello.elf + OpenOCD config only (no Vivado run); also used after a bitstream
-# made outside Bazel, e.g. by re-routing a saved checkpoint.
+# hello.elf, rvv_test.elf + OpenOCD config only (no Vivado run). Uses its own
+# Bazel output base, so it works while a bitstream build holds the main one.
+SW_OUTPUT_BASE="${HOME}/.cache/coral-sw-bazel"
+SW_TARGETS=(vcu118_hello vcu118_rvv_test)
 cmd_sw() {
   need_vivado   # gen_openocd_cfg.sh reads the BSDL from the Vivado install
   ( cmd_setup )
-  local bz elf
+  local bz t f
   bz="$(bazel_cmd)"
   cd "${WORK}"
-  "${bz}" build //fpga:vcu118_hello.elf
+  # --symlink_prefix=/ : do not repoint bazel-out/ while a bitstream build
+  # in the main output base may still be using it.
+  "${bz}" --output_base="${SW_OUTPUT_BASE}" build --symlink_prefix=/ "${SW_TARGETS[@]/#/\/\/fpga:}"
+  local execroot
+  execroot="$("${bz}" --output_base="${SW_OUTPUT_BASE}" info execution_root 2>/dev/null)"
   mkdir -p "${OUT}"
-  elf="$(bazel_files //fpga:vcu118_hello.elf | head -n1)"
-  cp -f "${WORK}/${elf}" "${OUT}/vcu118_hello.elf"
+  for t in "${SW_TARGETS[@]}"; do
+    f="$("${bz}" --output_base="${SW_OUTPUT_BASE}" cquery --output=files "//fpga:${t}" 2>/dev/null | grep '\.elf$' | head -n1)"
+    [[ -n "${f}" ]] || die "no ELF for //fpga:${t}"
+    cp -f "${execroot}/${f}" "${OUT}/${t}.elf"
+  done
   "${WORK}/fpga/vcu118/gen_openocd_cfg.sh" > "${OUT}/openocd_vcu118.cfg"
   info "outputs:"; ls -la "${OUT}"
+}
+
+# Load an ELF over JTAG into the running chip and show what it prints.
+cmd_run() {
+  local elf="${1:-}" dev log
+  [[ -f "${elf}" ]] || die "usage: ./coral run <program.elf>   (e.g. out/vcu118_rvv_test.elf)"
+  dev="$(find_uart)"
+  [[ -n "${dev}" ]] || die "no USB-UART found"
+  uart_setup "${dev}"
+  log="$(mktemp)"
+  cat "${dev}" > "${log}" &
+  UART_CAT_PID=$!
+  trap 'kill "${UART_CAT_PID:-}" 2>/dev/null || true' EXIT
+  cmd_load "${elf}" > "${log}.openocd" 2>&1 || { cat "${log}.openocd"; die "OpenOCD failed"; }
+  for _ in $(seq 1 100); do
+    grep -q "DONE" "${log}" && break
+    sleep 0.2
+  done
+  info "console output (${dev}):"
+  sed 's/\r//' "${log}"
+  grep -q "DONE" "${log}" || die "program did not print DONE within 20 s"
 }
 
 # ---------------------------------------------------------------------------
@@ -358,6 +389,6 @@ cmd_deploy() {
 # ---------------------------------------------------------------------------
 sub="${1:-}"; shift || true
 case "${sub}" in
-  doctor|setup|build|resume|sw|program|load|console|up|deploy) "cmd_${sub}" "$@" ;;
-  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  doctor|setup|build|resume|sw|run|program|load|console|up|deploy) "cmd_${sub}" "$@" ;;
+  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
