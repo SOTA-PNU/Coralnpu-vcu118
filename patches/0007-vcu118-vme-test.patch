@@ -1,0 +1,252 @@
+From 5f8760ebbff0a6349a1d63c7053120601ac6a0ec Mon Sep 17 00:00:00 2001
+From: SOTA-PNU <noreply@anthropic.com>
+Date: Tue, 20 Oct 2026 17:02:23 +0900
+Subject: [PATCH] fpga/vcu118: matrix-unit (VME) smoke test for the matrix
+ bitstreams
+
+---
+ fpga/BUILD                 |   6 ++
+ fpga/sw/vcu118/vme_test.cc | 214 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 220 insertions(+)
+ create mode 100644 fpga/sw/vcu118/vme_test.cc
+
+diff --git a/fpga/BUILD b/fpga/BUILD
+index 5a85795..ff30b10 100644
+--- a/fpga/BUILD
++++ b/fpga/BUILD
+@@ -981,6 +981,12 @@ coralnpu_v2_binary(
+     deps = [":uart"],
+ )
+ 
++coralnpu_v2_binary(
++    name = "vcu118_vme_test",
++    srcs = ["sw/vcu118/vme_test.cc"],
++    deps = [":uart"],
++)
++
+ VCU118_VIVADO_HOOKS = [
+     "vcu118_setup_hooks.tcl",
+     "vcu118_pre_opt_hooks.tcl",
+diff --git a/fpga/sw/vcu118/vme_test.cc b/fpga/sw/vcu118/vme_test.cc
+new file mode 100644
+index 0000000..70460f9
+--- /dev/null
++++ b/fpga/sw/vcu118/vme_test.cc
+@@ -0,0 +1,214 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// VCU118 matrix-unit (VME / Zvt) smoke test for the matrix_* bitstreams.
++// Instruction encodings and the operand layout follow
++// tests/cocotb/vme_test/vme_matmul_test_program.cc: one 16x16 int32/fp32
++// accumulator tile, C[:tm,:tn] += A[:tk,:tm]^T x B[:tk,:tn].
++// Each case is checked against a scalar reference; the last lines are
++// "VME PASS"/"VME FAIL" and "DONE".
++// On a vector_* bitstream (no VME) the first matrix instruction traps.
++
++#include <stdint.h>
++
++#include "fpga/sw/uart.h"
++
++#define TE 16
++
++static constexpr uint32_t kVtypeSew8Lmul1 = 0xC0;   // ta/ma, SEW8,  LMUL1
++static constexpr uint32_t kVtypeSew32Lmul4 = 0xD2;  // ta/ma, SEW32, LMUL4
++
++static constexpr uint32_t MtypeValue(uint32_t tm, uint32_t tk, uint32_t mtwiden) {
++  return ((tm & 0x3FFF) << 10) | ((tk & 0x7) << 5) | (mtwiden & 0x3);
++}
++static constexpr uint32_t ZvtWord(uint32_t funct6, uint32_t vs2, uint32_t rs1,
++                                  uint32_t funct3, uint32_t rd, uint32_t opcode) {
++  return (funct6 << 26) | (1u << 25) | (vs2 << 20) | (rs1 << 15) | (funct3 << 12) |
++         (rd << 7) | (opcode & 0x7Fu);
++}
++static constexpr uint32_t ZvtMatmulIntWord(uint32_t tile, bool signed_a) {
++  return ZvtWord(0x3C, 8, 16, 0, (tile << 1) | (signed_a ? 1 : 0), 0x77);
++}
++static constexpr uint32_t ZvtMatmulFpWord(uint32_t tile) {
++  return ZvtWord(0x3C, 8, 16, 1, tile << 1, 0x77);
++}
++static constexpr uint32_t ZvtVtzeroWord(uint32_t tile) {
++  return ZvtWord(0x10, 30, 0, 6, tile << 1, 0x57);
++}
++static constexpr uint32_t kVtmvVTWord = ZvtWord(0x10, 31, 10, 6, 4, 0x57);  // v4 <- tile row a0
++
++static inline __attribute__((always_inline)) void msetmtype(uint32_t mtype, uint32_t vtype) {
++  register uint32_t a0 asm("a0") = mtype;
++  register uint32_t a1 asm("a1") = vtype;
++  asm volatile(".insn r 0b1010111, 0b111, 0b1000001, x0, a0, a1" : : "r"(a0), "r"(a1));
++}
++static inline __attribute__((always_inline)) uint32_t msettn(uint32_t n) {
++  register uint32_t a0 asm("a0") = n;
++  register uint32_t t0 asm("t0");
++  asm volatile(".insn r 0b1010111, 0b111, 0b1000010, t0, a0, x0" : "=r"(t0) : "r"(a0));
++  return t0;
++}
++static inline __attribute__((always_inline)) uint32_t msettm(uint32_t m) {
++  register uint32_t a0 asm("a0") = m;
++  register uint32_t t0 asm("t0");
++  asm volatile(".insn r 0b1010111, 0b111, 0b1000010, t0, a0, x1" : "=r"(t0) : "r"(a0));
++  return t0;
++}
++
++static uint8_t mm_a[4 * TE] __attribute__((aligned(16)));
++static uint8_t mm_b[4 * TE] __attribute__((aligned(16)));
++static uint32_t mm_out[TE * TE] __attribute__((aligned(16)));
++static uint32_t mm_ref[TE * TE];
++
++static inline uint32_t cycles(void) {
++  uint32_t c;
++  asm volatile("csrr %0, mcycle" : "=r"(c));
++  return c;
++}
++
++static void readback_tile0(void) {
++  msetmtype(MtypeValue(TE, 1, 1), kVtypeSew32Lmul4);
++  (void)msettn(TE);
++  for (uint32_t i = 0; i < TE; i++) {
++    register uint32_t a0 asm("a0") = i;  // tss: tile 0, row i
++    asm volatile(".word %0" : : "i"(kVtmvVTWord), "r"(a0) : "v4", "v5", "v6", "v7", "memory");
++    asm volatile("vse32.v v4, (%0)" : : "r"(&mm_out[i * TE]) : "memory");
++  }
++}
++
++// int8 outer products into tile 0 (vtzero first). Returns cycles of the
++// operand loads + matmul instruction.
++template <bool SIGNED_A>
++static uint32_t run_int8(uint32_t tk) {
++  msetmtype(MtypeValue(TE, 1, 1), kVtypeSew32Lmul4);
++  (void)msettn(TE);
++  asm volatile(".word %0" : : "i"(ZvtVtzeroWord(0)) : "memory");
++  uint32_t t0 = cycles();
++  msetmtype(MtypeValue(TE, tk, 3), kVtypeSew8Lmul1);
++  (void)msettm(TE);
++  (void)msettn(TE);
++  asm volatile(
++      "vle8.v v8,  (%0)\n vle8.v v10, (%1)\n vle8.v v12, (%2)\n vle8.v v14, (%3)\n"
++      :
++      : "r"(&mm_a[0]), "r"(&mm_a[TE]), "r"(&mm_a[2 * TE]), "r"(&mm_a[3 * TE])
++      : "v8", "v10", "v12", "v14", "memory");
++  asm volatile(
++      "vle8.v v16, (%0)\n vle8.v v18, (%1)\n vle8.v v20, (%2)\n vle8.v v22, (%3)\n"
++      :
++      : "r"(&mm_b[0]), "r"(&mm_b[TE]), "r"(&mm_b[2 * TE]), "r"(&mm_b[3 * TE])
++      : "v16", "v18", "v20", "v22", "memory");
++  (void)msettn(TE);
++  asm volatile(".word %0" : : "i"(ZvtMatmulIntWord(0, SIGNED_A)) : "memory");
++  uint32_t t1 = cycles();
++  readback_tile0();
++  return t1 - t0;
++}
++
++static uint32_t ref_int8(uint32_t tk, bool signed_a) {
++  uint32_t t0 = cycles();
++  for (int m = 0; m < TE; m++)
++    for (int n = 0; n < TE; n++) {
++      int32_t acc = 0;
++      for (uint32_t k = 0; k < tk; k++) {
++        int32_t a = signed_a ? (int32_t)(int8_t)mm_a[k * TE + m] : (int32_t)mm_a[k * TE + m];
++        acc += a * (int32_t)mm_b[k * TE + n];
++      }
++      mm_ref[m * TE + n] = (uint32_t)acc;
++    }
++  return cycles() - t0;
++}
++
++// fp32: tk=1, A and B one 16-element row each.
++static float fa[TE] __attribute__((aligned(16)));
++static float fb[TE] __attribute__((aligned(16)));
++
++static uint32_t run_fp32(void) {
++  msetmtype(MtypeValue(TE, 1, 1), kVtypeSew32Lmul4);
++  (void)msettn(TE);
++  asm volatile(".word %0" : : "i"(ZvtVtzeroWord(0)) : "memory");
++  uint32_t t0 = cycles();
++  asm volatile("vle32.v v8, (%0)\n vle32.v v16, (%1)\n"
++               :
++               : "r"(fa), "r"(fb)
++               : "v8", "v9", "v10", "v11", "v16", "v17", "v18", "v19", "memory");
++  (void)msettn(TE);
++  asm volatile(".word %0" : : "i"(ZvtMatmulFpWord(0)) : "memory");
++  uint32_t t1 = cycles();
++  readback_tile0();
++  return t1 - t0;
++}
++
++static int compare(void) {
++  int bad = 0;
++  for (int i = 0; i < TE * TE; i++) bad += (mm_out[i] != mm_ref[i]);
++  return bad;
++}
++
++static void report(const char* name, int bad, uint32_t macs, uint32_t mcyc, uint32_t scyc) {
++  uart_puts("  ");
++  uart_puts(name);
++  uart_puts(bad ? "  FAIL mismatches=0x" : "  ok    MACs=0x");
++  uart_puthex32(bad ? (uint32_t)bad : macs);
++  uart_puts("  matrix cycles=0x");
++  uart_puthex32(mcyc);
++  uart_puts("  scalar cycles=0x");
++  uart_puthex32(scyc);
++  uart_puts("\r\n");
++}
++
++int main(void) {
++  uart_init();
++  uart_puts("VME (matrix unit) test on CoralNPU / VCU118\r\n");
++  asm volatile("csrs mstatus, %0" : : "r"(1u << 29));  // mstatus.MS = Initial
++
++  for (int i = 0; i < 4 * TE; i++) {
++    mm_a[i] = (uint8_t)(i * 37 + 11);
++    mm_b[i] = (uint8_t)(i * 53 + 7);
++  }
++  int all_bad = 0, bad;
++  uint32_t mc, sc;
++
++  mc = run_int8<false>(3);
++  sc = ref_int8(3, false);
++  bad = compare();
++  report("vtmmu u8xu8  16x16 k=3", bad, TE * TE * 3, mc, sc);
++  all_bad += bad;
++
++  mc = run_int8<true>(3);
++  sc = ref_int8(3, true);
++  bad = compare();
++  report("vtmms s8xu8  16x16 k=3", bad, TE * TE * 3, mc, sc);
++  all_bad += bad;
++
++  // quarter/half steps: products are exact in fp32
++  for (int i = 0; i < TE; i++) {
++    fa[i] = (float)(i % 9 - 4) * 0.25f;
++    fb[i] = (float)(i % 7 - 3) * 0.5f;
++  }
++  mc = run_fp32();
++  uint32_t t0 = cycles();
++  for (int m = 0; m < TE; m++)
++    for (int n = 0; n < TE; n++) {
++      float v = fa[m] * fb[n];
++      mm_ref[m * TE + n] = *(uint32_t*)&v;
++    }
++  sc = cycles() - t0;
++  bad = compare();
++  report("vtfmm f32     16x16 k=1", bad, TE * TE, mc, sc);
++  all_bad += bad;
++
++  uart_puts(all_bad ? "VME FAIL\r\n" : "VME PASS\r\n");
++  uart_puts("DONE\r\n");
++  return 0;
++}
+-- 
+2.43.0
+

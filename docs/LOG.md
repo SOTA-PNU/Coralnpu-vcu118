@@ -77,7 +77,11 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 
 - matrix_normal (벡터 + 매트릭스 유닛, 50 MHz) 빌드
   - ISP 제거 (`patches/0006`), 스왑 65 GB
-  - 끝나면 `tools/overnight.sh` 가 보드 적재와 테스트까지 수행
+  - 10/20: 합성·배치까지 21시간. VM 이 응답하지 않아 강제 종료한 뒤 `coral resume` 으로 physopt 체크포인트부터 배선 재개
+- 매트릭스 유닛 보드 테스트 (`vcu118_vme_test`, `patches/0007`)
+  - vtmmu / vtmms (int8, k=3)
+  - vtfmm (f32)
+  - 결과를 스칼라 기준값과 비교
 
 ## [진행 예정]
 

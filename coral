@@ -213,7 +213,7 @@ cmd_resume() {
 # hello.elf, rvv_test.elf + OpenOCD config only (no Vivado run). Uses its own
 # Bazel output base, so it works while a bitstream build holds the main one.
 SW_OUTPUT_BASE="${HOME}/.cache/coral-sw-bazel"
-SW_TARGETS=(vcu118_hello vcu118_rvv_test vcu118_matmul_bench)
+SW_TARGETS=(vcu118_hello vcu118_rvv_test vcu118_matmul_bench vcu118_vme_test)
 cmd_sw() {
   need_vivado   # gen_openocd_cfg.sh reads the BSDL from the Vivado install
   ( cmd_setup )
