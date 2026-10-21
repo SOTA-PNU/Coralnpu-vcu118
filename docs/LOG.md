@@ -73,19 +73,35 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 - vector 빌드 소요 시간: 7시간에서 2.5일까지 (메모리 압박에 좌우)
 - JTAG 적재 속도는 약 1.5–1.9 KiB/s
 
-## [진행 중]
+## [10/21] matrix_normal 은 VU9P 에 들어가지 않음 (배선 실패)
 
-- matrix_normal (벡터 + 매트릭스 유닛, 50 MHz) 빌드
-  - ISP 제거 (`patches/0006`), 스왑 65 GB
-  - 10/20: 합성·배치까지 21시간. VM 이 응답하지 않아 강제 종료한 뒤 `coral resume` 으로 physopt 체크포인트부터 배선 재개
-- 매트릭스 유닛 보드 테스트 (`vcu118_vme_test`, `patches/0007`)
-  - vtmmu / vtmms (int8, k=3)
-  - vtfmm (f32)
-  - 결과를 스칼라 기준값과 비교
+- 합성 → 배치 → physopt 까지는 완료. 배선(`coral resume`)에서 실패
+  - `Route 35-162`: 142,180 개 신호가 혼잡 때문에 배선되지 못함
+  - `Route 35-2`: node overlap 330,804 개가 남음
+  - overlap 이 1,875,633 에서 시작. vector_normal 은 263,215 에서 시작해 0 까지 내려갔음
+- 배치 후 사용률 (`chip_vcu118_physopt.dcp`)
+
+  | 자원 | vector_normal | matrix_normal (ISP 제거) |
+  |---|---|---|
+  | CLB LUT | 533k (45%) | **1,030k (87%)** |
+  | CLB (슬라이스) | — | **99.3%** |
+  | 레지스터 | 226k (10%) | 251k (11%) |
+  | URAM / DSP | — | 14% / 12% |
+  | SLR1→SLR2 교차 | — | 8,854 (51%) |
+
+- 결론
+  - 매트릭스 유닛이 LUT 를 약 50만 개 더 씀. VU9P(118만 LUT)에서는 CLB 가 99% 차서 배선 자원이 남지 않음
+  - 상류는 매트릭스 판을 VU13P(173만 LUT, 약 60%)에서 쓴다
+  - 클럭을 낮춰도 해결되지 않음 (타이밍이 아니라 배선 자원 문제)
+  - **VCU118 의 구성은 vector_normal / vector_highmem 으로 확정.** 매트릭스 판은 더 큰 FPGA 가 필요함
+- 빌드 환경 메모: 학교 PC 의 VBS / 메모리 무결성 때문에 VirtualBox 가 NEM 모드(AMD-V 미사용)로 동작함
+  - 그래서 soft lockup 이 생기고 빌드 시간이 크게 늘어남
+  - 보안 설정은 기관 관리 대상이라 원상 복구함
 
 ## [진행 예정]
 
-- 매트릭스 판 결과 확인: LUT, 50 MHz 타이밍, 매트릭스 명령 동작
+- (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음
+- 빌드 전용 PC 확보 (메모리 64 GB 이상, VBS 없음)
 - 보드에 올린 ELF 에 벡터 명령이 실제로 들어 있는지 objdump 로 확인
 - 행렬곱 커널 최적화 (레지스터 블로킹), 신경망 레이어 단위 측정
 - JTAG 적재 속도 개선

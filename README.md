@@ -131,6 +131,7 @@ BSCANE2 디버그 전송, 핀 XDC(AMD 보드 파일과 대조 완료), Vivado �
 ## 알려진 한계
 
 - **DDR4 미연결.** `0x8000_0000` 이상 접근 시 버스가 멈춘다 → CPU_RESET 버튼.
-- 보드 검증 완료 (vector_normal, 50 MHz): 부팅, JTAG 적재, UART, RVV, 행렬곱. 매트릭스 판은 빌드 중.
+- 보드 검증 완료 (vector_normal, 50 MHz): 부팅, JTAG 적재, UART, RVV, 행렬곱.
+- **matrix_* 판은 VU9P 에 들어가지 않는다.** LUT 87%, CLB 99% 로 배선에 실패한다. 상류는 VU13P 를 쓴다. 자세한 내용은 docs/LOG.md [10/21].
 - OpenOCD 의 IR 코드는 Vivado 의 BSDL 에서 읽는다(`gen_openocd_cfg.sh`). 첫 실행 때
   `out/openocd_vcu118.cfg` 의 값을 확인해 둘 것.
