@@ -1,0 +1,102 @@
+From 5edb9d6280c83329440f775cd277323c268b3069 Mon Sep 17 00:00:00 2001
+From: SOTA-PNU <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 10:11:05 +0900
+Subject: [PATCH] fpga/vcu118: highmem builds of the test programs; 128^3 int8
+ / 64^3 f32 matmul there
+
+---
+ fpga/BUILD                    | 15 +++++++++++++++
+ fpga/sw/vcu118/matmul_bench.c | 29 +++++++++++++++++++----------
+ 2 files changed, 34 insertions(+), 10 deletions(-)
+
+diff --git a/fpga/BUILD b/fpga/BUILD
+index ff30b10..58a7e39 100644
+--- a/fpga/BUILD
++++ b/fpga/BUILD
+@@ -987,6 +987,21 @@ coralnpu_v2_binary(
+     deps = [":uart"],
+ )
+ 
++# Same programs linked for the highmem bitstreams (ITCM/DTCM 1 MB each).
++[coralnpu_v2_binary(
++    name = n + "_highmem",
++    srcs = [src],
++    defines = defs,
++    dtcm_size_kbytes = 1024,
++    itcm_size_kbytes = 1024,
++    deps = [":uart"],
++) for n, src, defs in [
++    ("vcu118_hello", "sw/vcu118/hello.c", []),
++    ("vcu118_rvv_test", "sw/vcu118/rvv_test.c", []),
++    ("vcu118_matmul_bench", "sw/vcu118/matmul_bench.c", ["MM_N=128", "MM_F=64"]),
++    ("vcu118_vme_test", "sw/vcu118/vme_test.cc", []),
++]]
++
+ VCU118_VIVADO_HOOKS = [
+     "vcu118_setup_hooks.tcl",
+     "vcu118_pre_opt_hooks.tcl",
+diff --git a/fpga/sw/vcu118/matmul_bench.c b/fpga/sw/vcu118/matmul_bench.c
+index b0b1a08..f15cf34 100644
+--- a/fpga/sw/vcu118/matmul_bench.c
++++ b/fpga/sw/vcu118/matmul_bench.c
+@@ -24,12 +24,20 @@
+ 
+ #include "fpga/sw/uart.h"
+ 
+-#define M 32
+-#define K 32
+-#define N 32
+-#define FM 16
+-#define FK 16
+-#define FN 16
++// Sizes: 32/16 fit the 8 KB ITCM / 32 KB DTCM build; the highmem build
++// (1 MB / 1 MB) uses -DMM_N=128 -DMM_F=64.
++#ifndef MM_N
++#define MM_N 32
++#endif
++#ifndef MM_F
++#define MM_F 16
++#endif
++#define M MM_N
++#define K MM_N
++#define N MM_N
++#define FM MM_F
++#define FK MM_F
++#define FN MM_F
+ 
+ static int8_t a8[M][K], b8[K][N];
+ static int32_t c_v[M][N], c_s[M][N];
+@@ -67,9 +75,10 @@ static void report(const char* name, int ok, uint32_t macs, uint32_t vc,
+   uart_puts("  vector ");
+   put_dec(vc);
+   uart_puts(" cyc (");
+-  put_fix2(macs * 100u / vc);
++  uint32_t mpc100 = macs * 100u / vc;  // MAC/cycle x100 (macs <= 40M)
++  put_fix2(mpc100);
+   uart_puts(" MAC/cyc, ");
+-  put_fix2(macs * 5000u / vc);  // 50 MHz
++  put_fix2(mpc100 * 50u);  // x 50 MHz -> MMAC/s x100
+   uart_puts(" MMAC/s)  scalar ");
+   put_dec(sc);
+   uart_puts(" cyc  speedup ");
+@@ -153,7 +162,7 @@ int main(void) {
+   ok = 1;
+   for (int i = 0; i < M; ++i)
+     for (int j = 0; j < N; ++j) ok &= (c_v[i][j] == c_s[i][j]);
+-  report("int8 32x32x32", ok, M * N * K, t1 - t0, t2 - t1);
++  report(MM_N == 32 ? "int8 32x32x32" : "int8 128x128x128", ok, M * N * K, t1 - t0, t2 - t1);
+   all_ok &= ok;
+ 
+   t0 = cycles();
+@@ -164,7 +173,7 @@ int main(void) {
+   ok = 1;
+   for (int i = 0; i < FM; ++i)
+     for (int j = 0; j < FN; ++j) ok &= (cf_v[i][j] == cf_s[i][j]);
+-  report("f32  16x16x16", ok, FM * FN * FK, t1 - t0, t2 - t1);
++  report(MM_F == 16 ? "f32  16x16x16" : "f32  64x64x64", ok, FM * FN * FK, t1 - t0, t2 - t1);
+   all_ok &= ok;
+ 
+   uart_puts(all_ok ? "MATMUL PASS\r\n" : "MATMUL FAIL\r\n");
+-- 
+2.43.0
+

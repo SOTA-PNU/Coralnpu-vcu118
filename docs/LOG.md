@@ -98,6 +98,15 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
   - 그래서 soft lockup 이 생기고 빌드 시간이 크게 늘어남
   - 보안 설정은 기관 관리 대상이라 원상 복구함
 
+## [10/21] highmem 판으로 진행
+
+- vector_highmem 을 사용함: ITCM / DTCM 각 1 MB, 상류 구성 그대로
+- 테스트 프로그램의 highmem 링크판 추가 (`patches/0008`)
+  - `*_highmem.elf`
+  - matmul 은 int8 128³, f32 64³
+- `coral up` / `coral sw` 는 CONFIG 가 *highmem 이면 `_highmem` ELF 를 사용
+- `tools/overnight.sh <config>`: 빌드 → 보드 적재 → rvv / matmul
+
 ## [진행 예정]
 
 - (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음

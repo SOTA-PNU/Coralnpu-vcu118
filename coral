@@ -214,6 +214,9 @@ cmd_resume() {
 # Bazel output base, so it works while a bitstream build holds the main one.
 SW_OUTPUT_BASE="${HOME}/.cache/coral-sw-bazel"
 SW_TARGETS=(vcu118_hello vcu118_rvv_test vcu118_matmul_bench vcu118_vme_test)
+SW_TARGETS+=("${SW_TARGETS[@]/%/_highmem}")   # linked for ITCM/DTCM 1 MB
+# ELF suffix that matches the bitstream: *_highmem configs need *_highmem ELFs
+sw_sfx() { [[ "${CONFIG}" == *highmem ]] && echo _highmem || true; }
 cmd_sw() {
   need_vivado   # gen_openocd_cfg.sh reads the BSDL from the Vivado install
   ( cmd_setup )
@@ -355,7 +358,7 @@ cmd_up() {
     fi
   fi
 
-  cmd_load "${OUT}/vcu118_hello.elf"
+  cmd_load "${OUT}/vcu118_hello$(sw_sfx).elf"
 
   if [[ -n "${log}" ]]; then
     sleep 1
@@ -373,7 +376,7 @@ cmd_up() {
 # shellcheck disable=SC2029  # remote paths are meant to expand here
 cmd_deploy() {
   local then="${1:-}"
-  local bit="${OUT}/chip_vcu118_${CONFIG}.bit" elf="${OUT}/vcu118_hello.elf"
+  local bit="${OUT}/chip_vcu118_${CONFIG}.bit" elf="${OUT}/vcu118_hello$(sw_sfx).elf"
   [[ -f "${bit}" && -f "${elf}" ]] || die "nothing to deploy: run ./coral build first (${bit})"
   local ssh_opts=(-p "${BOARD_SSH_PORT}" -o ServerAliveInterval=30)
   local remote_out="${BOARD_REPO}/out"
