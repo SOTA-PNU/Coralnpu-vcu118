@@ -107,6 +107,32 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 - `coral up` / `coral sw` 는 CONFIG 가 *highmem 이면 `_highmem` ELF 를 사용
 - `tools/overnight.sh <config>`: 빌드 → 보드 적재 → rvv / matmul
 
+## [10/23] vector_highmem 보드 결과
+
+- 빌드 10/22 16:51 → 10/23 03:41 (약 11시간)
+- 타이밍: 라우팅 직후 WNS −0.972 ns → post-route phys_opt 후 **통과** (clk_main 50 MHz WNS 0.000, 실패 0)
+- 자원: LUT 43.7%, URAM 192 (20%), BRAM 0, DSP 392
+- RVV PASS
+- matmul int8 128³ 78.5 MMAC/s (스칼라 대비 17.45배), f32 64³ 52.0 MMAC/s (17.93배)
+
+## [10/26] 모델 ELF 실행 준비: DDR4 + JTAG 로더
+
+- 대상: IREE 모델 ELF (lenet5, charrnn, vgg, yolo)
+  - 코드와 가중치가 DDR 0x8000_0000 에 있음 (0.8 ~ 16 MB)
+  - 결과는 DTCM 의 `_ret`, `inference_*`, `status_msg`
+- 상류(Nexus) 방식
+  - DDR4 MIG + `nexus_loader` (FTDI SPI → SoC SPI 디바이스)
+  - MIG 코어는 Google 내부 경로에만 있음
+- VCU118 에서의 결정 (클럭 50 MHz 유지)
+  - DDR4: Vivado IP 카탈로그로 C1 컨트롤러 생성 (보드 파일 사용, AXI 256 비트, ECC 없음)
+  - 로더: 보드에 SPI 로 쓸 FTDI 가 없어 JTAG 사용. 디버그 모듈은 TCM 만 접근 가능
+    - ITCM 의 작은 스텁(`tools/ddr_stub.S`)이 DDR 로 복사
+    - 체크섬으로 검증 후 엔트리로 점프
+- 추가한 것
+  - `./coral ddr4-probe`: 합성 없이 IP 만 만들어 설정·포트 목록 확인 (몇 분)
+  - `./coral model <elf>`: 적재 → 실행 → 결과 출력
+- 다음: probe 결과로 `patches/0009` (chip_vcu118 에 DDR4 연결) 작성 → highmem 재빌드
+
 ## [진행 예정]
 
 - (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음
@@ -114,5 +140,5 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 - 보드에 올린 ELF 에 벡터 명령이 실제로 들어 있는지 objdump 로 확인
 - 행렬곱 커널 최적화 (레지스터 블로킹), 신경망 레이어 단위 측정
 - JTAG 적재 속도 개선
-- DDR4 MIG 연결 (현재는 미연결이라 0x8000_0000 이상 접근 불가)
+- DDR4 MIG 연결 (patches/0009, 10/26 진행 중)
 - 상류 결함 보고: autoboot 리셋 net 선언 순서 (Nexus ROM 빌드도 같은 문제로 추정)

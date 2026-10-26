@@ -13,6 +13,10 @@
 #   ./coral up [x.bit]        program + wait for the ROM banner + run hello.elf
 #   ./coral deploy [up]       copy out/ to the board host (fractal); "up" also runs
 #                             "coral up" there (build in the licensed VM, run on fractal)
+#   ./coral model <x.elf>     run a DDR-resident program (IREE model ELF) over JTAG
+#                             and print its inference_* results (DDR4 bitstream)
+#   ./coral ddr4-probe        generate the DDR4 C1 controller IP only (minutes) and
+#                             print its settings and ports -> out/ddr4_probe.txt
 #
 # Environment overrides: CONFIG, HW_SERVER, UART_DEV, BOARD_SSH* (see config.sh).
 set -euo pipefail
@@ -401,8 +405,40 @@ cmd_deploy() {
 }
 
 # ---------------------------------------------------------------------------
+# Run a program that lives in DDR (IREE model ELFs: entry 0x8000_0000) and
+# print the results it leaves in DTCM. Needs the vector_highmem bitstream with
+# DDR4 (patch 0009) already programmed. See tools/ddr_run.py.
+cmd_model() {
+  local elf="${1:-}"; shift || true
+  [[ -f "${elf}" ]] || die "usage: ./coral model <model.elf> [ddr_run.py options]"
+  if pgrep -x hw_server >/dev/null; then
+    die "hw_server holds the JTAG cable. Close Vivado Hardware Manager or: pkill -u \$USER -x hw_server"
+  fi
+  python3 "${ROOT}/tools/ddr_run.py" --cfg "$(openocd_cfg)" "${elf}" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# A few minutes, no synthesis: generate the DDR4 C1 controller the way the
+# build will (same script, same fake HOME as FuseSoC) and print its config and
+# port list. Run this before a multi-hour build that adds or changes DDR4.
+cmd_ddr4_probe() {
+  need_vivado
+  local work="${OUT}/ddr4_probe" report="${OUT}/ddr4_probe.txt" fakehome
+  mkdir -p "${OUT}"
+  fakehome="$(mktemp -d)"
+  info "generating the DDR4 C1 IP in ${work} (HOME=${fakehome}, like the FuseSoC build)"
+  (cd "${OUT}" && HOME="${fakehome}" vivado -mode batch -nojournal -nolog -notrace \
+      -source "${ROOT}/vivado/ddr4_probe.tcl" -tclargs "${work}") 2>&1 |
+    grep -E "^(PROBE|DDR4C1):|ERROR|CRITICAL" | tee "${report}"
+  rm -rf "${fakehome}"
+  grep -q "^PROBE: done" "${report}" || die "probe did not finish; see ${report}"
+  info "saved ${report}"
+}
+
+# ---------------------------------------------------------------------------
 sub="${1:-}"; shift || true
 case "${sub}" in
-  doctor|setup|build|resume|sw|run|program|load|console|up|deploy) "cmd_${sub}" "$@" ;;
-  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  ddr4-probe) cmd_ddr4_probe "$@" ;;
+  doctor|setup|build|resume|sw|run|program|load|console|up|deploy|model) "cmd_${sub}" "$@" ;;
+  *) sed -n '2,/^# Environment/p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
