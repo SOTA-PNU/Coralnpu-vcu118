@@ -21,6 +21,11 @@ proc vcu118_ddr4_c1_try {ip prop val} {
         vcu118_ddr4_c1_log "could not set $prop=$val ($err)"
         return 0
     }
+    set now [get_property $prop $ip]
+    if {$now ne $val} {
+        vcu118_ddr4_c1_log "set $prop=$val but it reads back $now"
+        return 0
+    }
     return 1
 }
 
@@ -78,28 +83,44 @@ proc vcu118_ddr4_c1 {ipdir} {
         vcu118_ddr4_c1_try $ip CONFIG.C0_CLOCK_BOARD_INTERFACE $clk_if
     }
 
-    # --- AXI towards the SoC -----------------------------------------------
+    # --- width and speed ----------------------------------------------------
+    # The controller's AXI width is fixed at 8 x DQ width (64-bit DQ -> 512).
+    # The SoC port is 256 bits (as on Nexus), so use 32 of C1's 64 DQ bits:
+    # 1 GB instead of 2 GB, half the bandwidth, which the 50 MHz core cannot
+    # use anyway, and no width converter. If the board preset refuses, the
+    # caller adds an AXI upsizer instead (vcu118_ddr4_c1_axi_up).
     vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_AxiSelection true
     vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_Ecc false
+    vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_DataWidth 32
     vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_AxiDataWidth 256
     vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_AxiIDWidth 4
     vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_AxiNarrowBurst true
-
-    # --- speed --------------------------------------------------------------
-    # The board preset runs C1 at DDR4-2400 (ui_clk 300 MHz). The SoC's
-    # DDR-side logic (AXI CDC) runs on ui_clk, so a slower memory clock buys
-    # timing margin at no cost that matters here (models are compute-bound).
-    # 1000 ps = DDR4-2000, ui_clk 250 MHz, 4x the 250 MHz input clock.
-    set tp_before [get_property CONFIG.C0.DDR4_TimePeriod $ip]
-    if {![vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_TimePeriod 1000]} {
-        set_property CONFIG.C0.DDR4_TimePeriod $tp_before $ip
-    }
+    # The preset runs C1 at DDR4-2400 (ui_clk 300 MHz). 1000 ps (ui_clk
+    # 250 MHz) would give the SoC's DDR-side CDC more margin.
+    vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_TimePeriod 1000
 
     foreach p {C0_DDR4_BOARD_INTERFACE C0_CLOCK_BOARD_INTERFACE C0.DDR4_MemoryPart
                C0.DDR4_MemoryType C0.DDR4_DataWidth C0.DDR4_Ecc C0.DDR4_TimePeriod
                C0.DDR4_InputClockPeriod C0.DDR4_AxiSelection C0.DDR4_AxiDataWidth
                C0.DDR4_AxiIDWidth C0.DDR4_AxiAddressWidth C0.DDR4_AxiNarrowBurst} {
         vcu118_ddr4_c1_log "$p = [get_property -quiet CONFIG.$p $ip]"
+    }
+    return $ip
+}
+
+# 256-bit SoC master -> wider controller slave, same clock (ui_clk).
+proc vcu118_ddr4_c1_axi_up {ipdir mi_width} {
+    if {[llength [get_ips -quiet ddr4_c1_axi_up]] == 0} {
+        create_ip -name axi_dwidth_converter -vendor xilinx.com -library ip \
+            -module_name ddr4_c1_axi_up -dir $ipdir
+    }
+    set ip [get_ips ddr4_c1_axi_up]
+    foreach {p v} [list PROTOCOL AXI4 SI_DATA_WIDTH 256 MI_DATA_WIDTH $mi_width \
+                        ADDR_WIDTH 31 SI_ID_WIDTH 4 ACLK_ASYNC 0] {
+        vcu118_ddr4_c1_try $ip CONFIG.$p $v
+    }
+    foreach p {PROTOCOL SI_DATA_WIDTH MI_DATA_WIDTH ADDR_WIDTH SI_ID_WIDTH ACLK_ASYNC FIFO_MODE} {
+        vcu118_ddr4_c1_log "axi_up $p = [get_property -quiet CONFIG.$p $ip]"
     }
     return $ip
 }

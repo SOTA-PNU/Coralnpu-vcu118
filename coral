@@ -15,8 +15,9 @@
 #                             "coral up" there (build in the licensed VM, run on fractal)
 #   ./coral model <x.elf>     run a DDR-resident program (IREE model ELF) over JTAG
 #                             and print its inference_* results (DDR4 bitstream)
-#   ./coral ddr4-probe        generate the DDR4 C1 controller IP only (minutes) and
-#                             print its settings and ports -> out/ddr4_probe.txt
+#   ./coral ddr4-probe [synth] generate the DDR4 C1 controller IP only (minutes) and
+#                             print its settings and ports -> out/ddr4_probe.txt;
+#                             "synth" also checks every DDR pin gets placed (~20 min)
 #
 # Environment overrides: CONFIG, HW_SERVER, UART_DEV, BOARD_SSH* (see config.sh).
 set -euo pipefail
@@ -432,7 +433,7 @@ cmd_ddr4_probe() {
   fakehome="$(mktemp -d)"
   info "generating the DDR4 C1 IP in ${work} (HOME=${fakehome}, like the FuseSoC build)"
   (cd "${OUT}" && HOME="${fakehome}" vivado -mode batch -nojournal -nolog -notrace \
-      -source "${ROOT}/vivado/ddr4_probe.tcl" -tclargs "${work}") 2>&1 |
+      -source "${ROOT}/vivado/ddr4_probe.tcl" -tclargs "${work}" "$@") 2>&1 |
     grep -E "^(PROBE|DDR4C1):|ERROR|CRITICAL" | tee "${report}"
   rm -rf "${fakehome}"
   grep -q "^PROBE: done" "${report}" || die "probe did not finish; see ${report}"
