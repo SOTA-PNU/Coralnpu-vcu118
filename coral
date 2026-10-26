@@ -425,6 +425,10 @@ cmd_ddr4_probe() {
   need_vivado
   local work="${OUT}/ddr4_probe" report="${OUT}/ddr4_probe.txt" fakehome
   mkdir -p "${OUT}"
+  # The fake HOME hides ~/.Xilinx/Xilinx.lic, exactly as in cmd_build.
+  if [[ -z "${XILINXD_LICENSE_FILE:-}" && -f "${HOME}/.Xilinx/Xilinx.lic" ]]; then
+    export XILINXD_LICENSE_FILE="${HOME}/.Xilinx/Xilinx.lic"
+  fi
   fakehome="$(mktemp -d)"
   info "generating the DDR4 C1 IP in ${work} (HOME=${fakehome}, like the FuseSoC build)"
   (cd "${OUT}" && HOME="${fakehome}" vivado -mode batch -nojournal -nolog -notrace \
