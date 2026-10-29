@@ -108,7 +108,9 @@ proc vcu118_ddr4_c1 {ipdir} {
     return $ip
 }
 
-# 256-bit SoC master -> wider controller slave, same clock (ui_clk).
+# SoC master (256 bit, main clock) -> controller slave (512 bit, ui_clk).
+# Packet FIFO with asynchronous clock conversion, so the SoC's DDR side stays
+# on the 50 MHz main clock and only this IP and the controller see 300 MHz.
 proc vcu118_ddr4_c1_axi_up {ipdir mi_width} {
     if {[llength [get_ips -quiet ddr4_c1_axi_up]] == 0} {
         create_ip -name axi_dwidth_converter -vendor xilinx.com -library ip \
@@ -116,11 +118,28 @@ proc vcu118_ddr4_c1_axi_up {ipdir mi_width} {
     }
     set ip [get_ips ddr4_c1_axi_up]
     foreach {p v} [list PROTOCOL AXI4 SI_DATA_WIDTH 256 MI_DATA_WIDTH $mi_width \
-                        ADDR_WIDTH 31 SI_ID_WIDTH 4 ACLK_ASYNC 0] {
-        vcu118_ddr4_c1_try $ip CONFIG.$p $v
+                        ADDR_WIDTH 31 SI_ID_WIDTH 4 FIFO_MODE 2 ACLK_ASYNC 1] {
+        if {![vcu118_ddr4_c1_try $ip CONFIG.$p $v]} {
+            error "DDR4C1: axi_up needs $p=$v (chip_vcu118.sv is written for it)"
+        }
     }
-    foreach p {PROTOCOL SI_DATA_WIDTH MI_DATA_WIDTH ADDR_WIDTH SI_ID_WIDTH ACLK_ASYNC FIFO_MODE} {
+    foreach p {PROTOCOL SI_DATA_WIDTH MI_DATA_WIDTH ADDR_WIDTH SI_ID_WIDTH FIFO_MODE ACLK_ASYNC SYNCHRONIZATION_STAGES} {
         vcu118_ddr4_c1_log "axi_up $p = [get_property -quiet CONFIG.$p $ip]"
     }
     return $ip
+}
+
+# Everything chip_vcu118.sv instantiates. Stops the build at once if the
+# controller does not come out the way the RTL is wired for.
+proc vcu118_ddr4_c1_all {ipdir} {
+    set ip [vcu118_ddr4_c1 $ipdir]
+    foreach {p v} {C0.DDR4_AxiSelection true C0.DDR4_DataWidth 64 C0.DDR4_AxiDataWidth 512
+                   C0.DDR4_AxiIDWidth 4 C0.DDR4_AxiAddressWidth 31 C0.DDR4_Ecc false} {
+        set now [get_property CONFIG.$p $ip]
+        if {$now ne $v} {
+            error "DDR4C1: ddr4_c1 has $p=$now, chip_vcu118.sv expects $v"
+        }
+    }
+    set up [vcu118_ddr4_c1_axi_up $ipdir 512]
+    return [list $ip $up]
 }

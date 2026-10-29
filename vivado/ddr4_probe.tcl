@@ -17,13 +17,8 @@ source [file join $here ddr4_c1_ip.tcl]
 puts "PROBE: vivado [version -short]"
 puts "PROBE: board parts (default paths): [get_board_parts -quiet *vcu118*]"
 
-set ip [vcu118_ddr4_c1 [file join $work ip]]
-set axiw [get_property CONFIG.C0.DDR4_AxiDataWidth $ip]
-set ips [list $ip]
-if {$axiw != 256} {
-    puts "PROBE: controller AXI is $axiw bits; adding a 256->$axiw upsizer"
-    lappend ips [vcu118_ddr4_c1_axi_up [file join $work ip] $axiw]
-}
+set ips [vcu118_ddr4_c1_all [file join $work ip]]
+set ip [lindex $ips 0]
 generate_target {instantiation_template synthesis} $ips
 
 proc ports_of {work name} {
@@ -42,7 +37,11 @@ proc ports_of {work name} {
     return $ports
 }
 set ports [ports_of $work ddr4_c1]
-if {[llength $ips] > 1} { ports_of $work ddr4_c1_axi_up }
+set up_ports [ports_of $work ddr4_c1_axi_up]
+foreach need {m_axi_aclk m_axi_aresetn s_axi_aclk s_axi_aresetn} {
+    if {[lsearch -index 2 $up_ports $need] < 0} { error "PROBE: ddr4_c1_axi_up has no $need" }
+}
+puts "PROBE: ports match chip_vcu118.sv expectations"
 
 set nbp 0
 foreach x [glob -nocomplain -directory [file join $work ip ddr4_c1] -types f */*.xdc *.xdc] {

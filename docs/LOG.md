@@ -133,6 +133,23 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
   - `./coral model <elf>`: 적재 → 실행 → 결과 출력
 - 다음: probe 결과로 `patches/0009` (chip_vcu118 에 DDR4 연결) 작성 → highmem 재빌드
 
+## [10/29] DDR4 C1 연결 (`patches/0009`)
+
+- `./coral ddr4-probe synth` 결과 (Vivado 2026.1, 보드 파일 vcu118 3.0)
+  - 인터페이스 `ddr4_sdram_c1_062`, MT40A256M16LY-062E, 64비트, DDR4-2400
+  - 보드 프리셋이 폭·속도를 고정함: AXI 512비트, ui_clk 300 MHz (32비트/DDR4-2000 설정은 무시됨)
+  - 컨트롤러만 합성: 포트 118개 전부 배치됨 (sys_clk E12, dq[0] F11), LUT 약 2만
+- 연결 방식
+  - SoC DDR AXI(256비트, 50 MHz) → `axi_dwidth_converter`(256→512, 비동기 클럭 변환) → DDR4 컨트롤러(300 MHz)
+  - 상류 Nexus 는 SoC DDR 쪽을 ui_clk 로 돌리지만, 여기서는 300 MHz 를 Xilinx IP 안에만 둠
+  - 주소 0x8000_0000 → 컨트롤러 0 (비트 31 제거)
+  - DDR 제어 포트(Nexus 의 ECC 레지스터)는 OKAY 응답기
+  - 보정 완료 신호 → GPIO 입력 비트 0, LED 7 (LED 6:4 = GPIO 2:0)
+- 검사
+  - Verilator 로 top 포트 연결 검사 (IP 는 생성된 템플릿으로 만든 stub)
+  - 패치 0001~0009 가 상류 15573b6 에 깨끗이 적용되는 것 확인
+  - IP 설정이 RTL 과 다르면 setup 훅에서 바로 중단
+
 ## [진행 예정]
 
 - (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음

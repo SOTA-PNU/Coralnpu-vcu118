@@ -1,0 +1,828 @@
+From 78b5bba70fd94d926df2de2ad084ecba112a2fa4 Mon Sep 17 00:00:00 2001
+From: donghun <ehdgns1083@pusan.ac.kr>
+Date: Thu, 29 Oct 2026 18:16:15 +0900
+Subject: [PATCH] fpga/vcu118: DDR4 C1 at 0x80000000 (Vivado DDR4 controller
+ from the board files)
+
+The public tree only has ddr4_stub; Nexus uses an internal MIG core. Here
+the controller is generated from the IP catalog with the VCU118 board files
+(vcu118_ddr4_c1_ip.tcl, sourced by the setup hook), so the board flow places
+the 118 memory/clock pins. Board preset: 64-bit DQ, DDR4-2400, AXI 512 bit,
+ui_clk 300 MHz (width and speed are locked by the preset).
+
+The SoC's 256-bit DDR AXI goes through an axi_dwidth_converter with
+asynchronous clock conversion, so the SoC's DDR side stays on the 50 MHz main
+clock and only Xilinx IP runs at 300 MHz. Address bit 31 is dropped
+(0x8000_0000 -> controller 0). The DDR control AXI port (ECC registers on
+Nexus) gets an OKAY responder. init_calib_complete drives GPIO input bit 0
+(xpm_cdc_single) and LED 7; LEDs 6:4 show GPIO 2:0. The controller reset is
+CPU_RESET or not-yet-EOS (STARTUPE3), as on Nexus.
+
+Port widths were taken from the generated instantiation template; the build
+stops in the setup hook if the IP comes out differently.
+---
+ fpga/BUILD                  |   4 +-
+ fpga/chip_vcu118.core       |   3 +-
+ fpga/rtl/chip_vcu118.sv     | 503 +++++++++++++++++++++++++++++++-----
+ fpga/vcu118_ddr4_c1_ip.tcl  | 145 +++++++++++
+ fpga/vcu118_setup_hooks.tcl |   4 +
+ 5 files changed, 586 insertions(+), 73 deletions(-)
+ create mode 100644 fpga/vcu118_ddr4_c1_ip.tcl
+
+diff --git a/fpga/BUILD b/fpga/BUILD
+index 58a7e39..aad722d 100644
+--- a/fpga/BUILD
++++ b/fpga/BUILD
+@@ -919,7 +919,8 @@ collect_coralnpu_elfs()
+ # Debug transport goes over the FPGA's own JTAG (BSCANE2), so the board needs
+ # no extra cable. The SoC boots a small ROM (sw/vcu118/rom_park.c) that prints
+ # a banner on the USB-UART and parks; programs are then loaded with OpenOCD.
+-# DDR4 is not connected in this build (see rtl/chip_vcu118.sv).
++# DDR4 C1 (2 GB) at 0x8000_0000 through a Vivado DDR4 controller generated
++# from the VCU118 board files (vcu118_ddr4_c1_ip.tcl, see rtl/chip_vcu118.sv).
+ #
+ #   bazel build //fpga:build_chip_vcu118_synth_only_vector_normal   # LUT count
+ #   bazel build //fpga:build_chip_vcu118_bitstream_vector_normal    # .bit
+@@ -1004,6 +1005,7 @@ coralnpu_v2_binary(
+ 
+ VCU118_VIVADO_HOOKS = [
+     "vcu118_setup_hooks.tcl",
++    "vcu118_ddr4_c1_ip.tcl",
+     "vcu118_pre_opt_hooks.tcl",
+     "check_pin_assignments.tcl",
+     "vivado_post_place_hooks.tcl",
+diff --git a/fpga/chip_vcu118.core b/fpga/chip_vcu118.core
+index 8c6f5a8..82edc71 100644
+--- a/fpga/chip_vcu118.core
++++ b/fpga/chip_vcu118.core
+@@ -13,7 +13,7 @@ CAPI=2:
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ name: "com.google.coralnpu:fpga:chip_vcu118:0.1"
+-description: "VCU118-specific top-level for CoralNPU (BSCANE2 debug, no DDR)."
++description: "VCU118-specific top-level for CoralNPU (BSCANE2 debug, DDR4 C1)."
+ 
+ filesets:
+   files_rtl:
+@@ -35,6 +35,7 @@ filesets:
+   files_tcl:
+     files:
+       - vcu118_setup_hooks.tcl: { file_type: tclSource }
++      - vcu118_ddr4_c1_ip.tcl: { file_type: user, copyto: vcu118_ddr4_c1_ip.tcl }
+       - check_pin_assignments.tcl: { file_type: user, copyto: check_pin_assignments.tcl }
+       - vcu118_pre_opt_hooks.tcl: { file_type: user, copyto: vcu118_pre_opt_hooks.tcl }
+       - vivado_post_place_hooks.tcl: { file_type: user, copyto: vivado_post_place_hooks.tcl }
+diff --git a/fpga/rtl/chip_vcu118.sv b/fpga/rtl/chip_vcu118.sv
+index 1914fc2..968c9c8 100644
+--- a/fpga/rtl/chip_vcu118.sv
++++ b/fpga/rtl/chip_vcu118.sv
+@@ -22,12 +22,21 @@
+ //            talks to the same USB-JTAG used to load the bitstream.
+ //   * UART:  the software console is UART1 (0x4001_0000, see fpga/sw/uart.c),
+ //            so UART1 goes to the on-board CP2105 USB-UART. UART0 is unused.
+-//   * DDR4:  not connected yet. The SoC's DDR AXI ports are tied off exactly
+-//            like fpga/ip/ddr4_stub (never ready), so any access to
+-//            0x8000_0000.. hangs the bus. Do not touch DDR on this build.
++//   * DDR4:  the on-board C1 component memory (2 GB, 64-bit, DDR4-2400) through
++//            a Vivado DDR4 controller "ddr4_c1" generated from the VCU118
++//            board files (vcu118_ddr4_c1_ip.tcl), at 0x8000_0000 like Nexus.
++//            Nexus clocks the SoC's DDR side with the controller's ui_clk;
++//            here that side stays on the 50 MHz main clock and an AXI
++//            width/clock converter "ddr4_c1_axi_up" (256 -> 512 bits,
++//            main clk -> 300 MHz ui_clk) sits in front of the controller,
++//            so only Xilinx IP runs at 300 MHz. The SoC's AXI-lite DDR
++//            control port (ECC registers on Nexus) gets an OKAY responder.
++//            init_calib_complete -> GPIO input bit 0 and LED 7: software
++//            must wait for it before touching DDR (an early access stalls
++//            the bus until calibration ends).
+ //   * SPI device / SPI host / SPI flash / I2C / camera: not connected.
+ //   * LEDs: [0] MMCM locked [1] heartbeat [2] io_halted [3] io_fault
+-//           [7:4] SoC GPIO[3:0]
++//           [6:4] SoC GPIO[2:0] [7] DDR4 calibrated
+ module chip_vcu118 #(
+     parameter MemInitFile = "",
+     parameter int ClockFrequencyMhz = 50,
+@@ -44,7 +53,25 @@ module chip_vcu118 #(
+     input  logic       cpu_reset,     // active high push button
+     output logic       uart_txd,      // FPGA -> CP2105 (USB_UART_TX)
+     input  logic       uart_rxd,      // CP2105 -> FPGA (USB_UART_RX)
+-    output logic [7:0] led
++    output logic [7:0] led,
++    // DDR4 C1. Port names match the controller's so the board flow
++    // (ddr4_c1_board.xdc) places them; do not rename.
++    input  logic        c0_sys_clk_p,  // 250 MHz (default_250mhz_clk1)
++    input  logic        c0_sys_clk_n,
++    output logic        c0_ddr4_act_n,
++    output logic [16:0] c0_ddr4_adr,
++    output logic [1:0]  c0_ddr4_ba,
++    output logic [0:0]  c0_ddr4_bg,
++    output logic [0:0]  c0_ddr4_cke,
++    output logic [0:0]  c0_ddr4_odt,
++    output logic [0:0]  c0_ddr4_cs_n,
++    output logic [0:0]  c0_ddr4_ck_t,
++    output logic [0:0]  c0_ddr4_ck_c,
++    output logic        c0_ddr4_reset_n,
++    inout  wire  [7:0]  c0_ddr4_dm_dbi_n,
++    inout  wire  [63:0] c0_ddr4_dq,
++    inout  wire  [7:0]  c0_ddr4_dqs_t,
++    inout  wire  [7:0]  c0_ddr4_dqs_c
+ );
+ 
+   // ------------------------------------------------------------------
+@@ -81,6 +108,7 @@ module chip_vcu118 #(
+   // ------------------------------------------------------------------
+   logic [7:0] gpio_out, gpio_en;
+   logic io_halted, io_fault;
++  logic ddr_calib, ddr_calib_sync;
+ 
+   // ~1.5 Hz at 50 MHz: proves the main clock is alive without any software.
+   logic [24:0] heartbeat_q;
+@@ -93,7 +121,8 @@ module chip_vcu118 #(
+   assign led[1]   = heartbeat_q[24];
+   assign led[2]   = io_halted;
+   assign led[3]   = io_fault;
+-  assign led[7:4] = gpio_out[3:0] & gpio_en[3:0];
++  assign led[6:4] = gpio_out[2:0] & gpio_en[2:0];
++  assign led[7]   = ddr_calib;
+ 
+   // ------------------------------------------------------------------
+   // RISC-V debug transport over BSCANE2
+@@ -127,10 +156,255 @@ module chip_vcu118 #(
+   );
+ 
+   // ------------------------------------------------------------------
+-  // DDR AXI tie-off (same behaviour as fpga/ip/ddr4_stub: never ready)
++  // DDR4: SoC (main clk, 256 bit) -> ddr4_c1_axi_up -> ddr4_c1 (ui_clk, 512 bit)
+   // ------------------------------------------------------------------
+-  logic ddr_ctrl_aw_valid, ddr_ctrl_w_valid, ddr_ctrl_ar_valid;
+-  logic ddr_mem_aw_valid, ddr_mem_w_valid, ddr_mem_ar_valid;
++  // SoC side, main clock
++  logic [31:0]  m_awaddr, m_araddr;
++  logic [0:0]   m_awid, m_arid, m_bid, m_rid;
++  logic [7:0]   m_awlen, m_arlen;
++  logic [2:0]   m_awsize, m_arsize, m_awprot, m_arprot;
++  logic [1:0]   m_awburst, m_arburst, m_bresp, m_rresp;
++  logic         m_awlock, m_arlock;
++  logic [3:0]   m_awcache, m_arcache, m_awqos, m_arqos, m_awregion, m_arregion;
++  logic         m_awvalid, m_awready, m_wvalid, m_wready, m_wlast;
++  logic         m_bvalid, m_bready, m_arvalid, m_arready;
++  logic         m_rvalid, m_rready, m_rlast;
++  logic [255:0] m_wdata, m_rdata;
++  logic [31:0]  m_wstrb;
++  logic [3:0]   up_bid, up_rid;
++
++  // Controller side, ui_clk (300 MHz)
++  logic         ui_clk, ui_rst;
++  logic [30:0]  c_awaddr, c_araddr;
++  logic [7:0]   c_awlen, c_arlen;
++  logic [2:0]   c_awsize, c_arsize, c_awprot, c_arprot;
++  logic [1:0]   c_awburst, c_arburst, c_bresp, c_rresp;
++  logic [0:0]   c_awlock, c_arlock;
++  logic [3:0]   c_awcache, c_arcache, c_awqos, c_arqos;
++  logic         c_awvalid, c_awready, c_wvalid, c_wready, c_wlast;
++  logic         c_bvalid, c_bready, c_arvalid, c_arready;
++  logic         c_rvalid, c_rready, c_rlast;
++  logic [511:0] c_wdata, c_rdata;
++  logic [63:0]  c_wstrb;
++
++  // Controller reset: push button, and hold until configuration is done
++  // (STARTUPE3 EOS), as chip_nexus does.
++  logic eos;
++  STARTUPE3 i_startupe3 (
++      .EOS      (eos),
++      .CFGCLK   (),
++      .CFGMCLK  (),
++      .PREQ     (),
++      .DI       (),
++      .DO       (4'b0),
++      .DTS      (4'b1111),
++      .FCSBO    (1'b1),
++      .FCSBTS   (1'b1),
++      .GSR      (1'b0),
++      .GTS      (1'b0),
++      .KEYCLEARB(1'b1),
++      .PACK     (1'b0),
++      .USRCCLKO (1'b0),
++      .USRCCLKTS(1'b1),
++      .USRDONEO (1'b1),
++      .USRDONETS(1'b1)
++  );
++
++  ddr4_c1 i_ddr4 (
++      .sys_rst                (cpu_reset | ~eos),
++      .c0_sys_clk_p           (c0_sys_clk_p),
++      .c0_sys_clk_n           (c0_sys_clk_n),
++      .c0_init_calib_complete (ddr_calib),
++      .dbg_clk                (),
++      .dbg_bus                (),
++      .addn_ui_clkout1        (),
++      .c0_ddr4_act_n          (c0_ddr4_act_n),
++      .c0_ddr4_adr            (c0_ddr4_adr),
++      .c0_ddr4_ba             (c0_ddr4_ba),
++      .c0_ddr4_bg             (c0_ddr4_bg),
++      .c0_ddr4_cke            (c0_ddr4_cke),
++      .c0_ddr4_odt            (c0_ddr4_odt),
++      .c0_ddr4_cs_n           (c0_ddr4_cs_n),
++      .c0_ddr4_ck_t           (c0_ddr4_ck_t),
++      .c0_ddr4_ck_c           (c0_ddr4_ck_c),
++      .c0_ddr4_reset_n        (c0_ddr4_reset_n),
++      .c0_ddr4_dm_dbi_n       (c0_ddr4_dm_dbi_n),
++      .c0_ddr4_dq             (c0_ddr4_dq),
++      .c0_ddr4_dqs_c          (c0_ddr4_dqs_c),
++      .c0_ddr4_dqs_t          (c0_ddr4_dqs_t),
++      .c0_ddr4_ui_clk         (ui_clk),
++      .c0_ddr4_ui_clk_sync_rst(ui_rst),
++      .c0_ddr4_aresetn        (~ui_rst),
++      .c0_ddr4_s_axi_awid     (4'b0),
++      .c0_ddr4_s_axi_awaddr   (c_awaddr),
++      .c0_ddr4_s_axi_awlen    (c_awlen),
++      .c0_ddr4_s_axi_awsize   (c_awsize),
++      .c0_ddr4_s_axi_awburst  (c_awburst),
++      .c0_ddr4_s_axi_awlock   (c_awlock),
++      .c0_ddr4_s_axi_awcache  (c_awcache),
++      .c0_ddr4_s_axi_awprot   (c_awprot),
++      .c0_ddr4_s_axi_awqos    (c_awqos),
++      .c0_ddr4_s_axi_awvalid  (c_awvalid),
++      .c0_ddr4_s_axi_awready  (c_awready),
++      .c0_ddr4_s_axi_wdata    (c_wdata),
++      .c0_ddr4_s_axi_wstrb    (c_wstrb),
++      .c0_ddr4_s_axi_wlast    (c_wlast),
++      .c0_ddr4_s_axi_wvalid   (c_wvalid),
++      .c0_ddr4_s_axi_wready   (c_wready),
++      .c0_ddr4_s_axi_bready   (c_bready),
++      .c0_ddr4_s_axi_bid      (),
++      .c0_ddr4_s_axi_bresp    (c_bresp),
++      .c0_ddr4_s_axi_bvalid   (c_bvalid),
++      .c0_ddr4_s_axi_arid     (4'b0),
++      .c0_ddr4_s_axi_araddr   (c_araddr),
++      .c0_ddr4_s_axi_arlen    (c_arlen),
++      .c0_ddr4_s_axi_arsize   (c_arsize),
++      .c0_ddr4_s_axi_arburst  (c_arburst),
++      .c0_ddr4_s_axi_arlock   (c_arlock),
++      .c0_ddr4_s_axi_arcache  (c_arcache),
++      .c0_ddr4_s_axi_arprot   (c_arprot),
++      .c0_ddr4_s_axi_arqos    (c_arqos),
++      .c0_ddr4_s_axi_arvalid  (c_arvalid),
++      .c0_ddr4_s_axi_arready  (c_arready),
++      .c0_ddr4_s_axi_rready   (c_rready),
++      .c0_ddr4_s_axi_rlast    (c_rlast),
++      .c0_ddr4_s_axi_rvalid   (c_rvalid),
++      .c0_ddr4_s_axi_rresp    (c_rresp),
++      .c0_ddr4_s_axi_rid      (),
++      .c0_ddr4_s_axi_rdata    (c_rdata)
++  );
++
++  // 0x8000_0000.. -> controller address 0 (2 GB window, bit 31 dropped).
++  ddr4_c1_axi_up i_ddr_axi_up (
++      .s_axi_aclk    (clk),
++      .s_axi_aresetn (rst_n),
++      .s_axi_awid    ({3'b0, m_awid}),
++      .s_axi_awaddr  (m_awaddr[30:0]),
++      .s_axi_awlen   (m_awlen),
++      .s_axi_awsize  (m_awsize),
++      .s_axi_awburst (m_awburst),
++      .s_axi_awlock  (m_awlock),
++      .s_axi_awcache (m_awcache),
++      .s_axi_awprot  (m_awprot),
++      .s_axi_awregion(m_awregion),
++      .s_axi_awqos   (m_awqos),
++      .s_axi_awvalid (m_awvalid),
++      .s_axi_awready (m_awready),
++      .s_axi_wdata   (m_wdata),
++      .s_axi_wstrb   (m_wstrb),
++      .s_axi_wlast   (m_wlast),
++      .s_axi_wvalid  (m_wvalid),
++      .s_axi_wready  (m_wready),
++      .s_axi_bid     (up_bid),
++      .s_axi_bresp   (m_bresp),
++      .s_axi_bvalid  (m_bvalid),
++      .s_axi_bready  (m_bready),
++      .s_axi_arid    ({3'b0, m_arid}),
++      .s_axi_araddr  (m_araddr[30:0]),
++      .s_axi_arlen   (m_arlen),
++      .s_axi_arsize  (m_arsize),
++      .s_axi_arburst (m_arburst),
++      .s_axi_arlock  (m_arlock),
++      .s_axi_arcache (m_arcache),
++      .s_axi_arprot  (m_arprot),
++      .s_axi_arregion(m_arregion),
++      .s_axi_arqos   (m_arqos),
++      .s_axi_arvalid (m_arvalid),
++      .s_axi_arready (m_arready),
++      .s_axi_rid     (up_rid),
++      .s_axi_rdata   (m_rdata),
++      .s_axi_rresp   (m_rresp),
++      .s_axi_rlast   (m_rlast),
++      .s_axi_rvalid  (m_rvalid),
++      .s_axi_rready  (m_rready),
++      .m_axi_aclk    (ui_clk),
++      .m_axi_aresetn (~ui_rst),
++      .m_axi_awaddr  (c_awaddr),
++      .m_axi_awlen   (c_awlen),
++      .m_axi_awsize  (c_awsize),
++      .m_axi_awburst (c_awburst),
++      .m_axi_awlock  (c_awlock),
++      .m_axi_awcache (c_awcache),
++      .m_axi_awprot  (c_awprot),
++      .m_axi_awregion(),
++      .m_axi_awqos   (c_awqos),
++      .m_axi_awvalid (c_awvalid),
++      .m_axi_awready (c_awready),
++      .m_axi_wdata   (c_wdata),
++      .m_axi_wstrb   (c_wstrb),
++      .m_axi_wlast   (c_wlast),
++      .m_axi_wvalid  (c_wvalid),
++      .m_axi_wready  (c_wready),
++      .m_axi_bresp   (c_bresp),
++      .m_axi_bvalid  (c_bvalid),
++      .m_axi_bready  (c_bready),
++      .m_axi_araddr  (c_araddr),
++      .m_axi_arlen   (c_arlen),
++      .m_axi_arsize  (c_arsize),
++      .m_axi_arburst (c_arburst),
++      .m_axi_arlock  (c_arlock),
++      .m_axi_arcache (c_arcache),
++      .m_axi_arprot  (c_arprot),
++      .m_axi_arregion(),
++      .m_axi_arqos   (c_arqos),
++      .m_axi_arvalid (c_arvalid),
++      .m_axi_arready (c_arready),
++      .m_axi_rdata   (c_rdata),
++      .m_axi_rresp   (c_rresp),
++      .m_axi_rlast   (c_rlast),
++      .m_axi_rvalid  (c_rvalid),
++      .m_axi_rready  (c_rready)
++  );
++  assign m_bid = up_bid[0];
++  assign m_rid = up_rid[0];
++
++  // Calibration status into the main clock domain (GPIO input bit 0).
++  xpm_cdc_single #(
++      .DEST_SYNC_FF  (3),
++      .SRC_INPUT_REG (0)
++  ) i_calib_sync (
++      .src_clk (1'b0),
++      .src_in  (ddr_calib),
++      .dest_clk(clk),
++      .dest_out(ddr_calib_sync)
++  );
++
++  // AXI-lite DDR control port (ECC registers on Nexus): answer OKAY / 0.
++  logic        dc_awvalid, dc_awready, dc_wvalid, dc_wready, dc_wlast;
++  logic        dc_bvalid, dc_bready, dc_arvalid, dc_arready;
++  logic        dc_rvalid, dc_rready, dc_rlast;
++  logic [5:0]  dc_awid, dc_arid, dc_bid, dc_rid;
++  logic [7:0]  dc_arlen;
++  logic [1:0]  dc_bresp, dc_rresp;
++  logic [31:0] dc_rdata;
++
++  vcu118_axi_okay_slave #(
++      .IdWidth  (6),
++      .DataWidth(32)
++  ) i_ddr_ctrl_okay (
++      .clk_i     (clk),
++      .rst_ni    (rst_n),
++      .aw_valid_i(dc_awvalid),
++      .aw_ready_o(dc_awready),
++      .aw_id_i   (dc_awid),
++      .w_valid_i (dc_wvalid),
++      .w_ready_o (dc_wready),
++      .w_last_i  (dc_wlast),
++      .b_valid_o (dc_bvalid),
++      .b_ready_i (dc_bready),
++      .b_id_o    (dc_bid),
++      .b_resp_o  (dc_bresp),
++      .ar_valid_i(dc_arvalid),
++      .ar_ready_o(dc_arready),
++      .ar_id_i   (dc_arid),
++      .ar_len_i  (dc_arlen),
++      .r_valid_o (dc_rvalid),
++      .r_ready_i (dc_rready),
++      .r_id_o    (dc_rid),
++      .r_data_o  (dc_rdata),
++      .r_resp_o  (dc_rresp),
++      .r_last_o  (dc_rlast)
++  );
+ 
+   // ------------------------------------------------------------------
+   // SoC
+@@ -170,7 +444,7 @@ module chip_vcu118 #(
+       .spim_flash_rst_no(),
+       .gpio_o           (gpio_out),
+       .gpio_en_o        (gpio_en),
+-      .gpio_i           (8'h00),
++      .gpio_i           ({7'h00, ddr_calib_sync}),
+       // Camera / ISP: no sensor on this board
+       .ISP_DVP_D0       (1'b0),
+       .ISP_DVP_D1       (1'b0),
+@@ -197,15 +471,15 @@ module chip_vcu118 #(
+       .sda_en_o         (),
+       .io_halted        (io_halted),
+       .io_fault         (io_fault),
+-      // DDR: clocked so the CDC logic is not left floating, but never ready
++      // DDR side on the main clock; ddr4_c1_axi_up crosses to ui_clk.
+       .ddr_clk_i        (clk),
+       .ddr_rst          (~rst_n),
+ 
+-      .io_ddr_ctrl_axi_aw_valid    (ddr_ctrl_aw_valid),
+-      .io_ddr_ctrl_axi_aw_ready    (1'b0),
++      .io_ddr_ctrl_axi_aw_valid    (dc_awvalid),
++      .io_ddr_ctrl_axi_aw_ready    (dc_awready),
+       .io_ddr_ctrl_axi_aw_bits_addr(),
+       .io_ddr_ctrl_axi_aw_bits_prot(),
+-      .io_ddr_ctrl_axi_aw_bits_id  (),
++      .io_ddr_ctrl_axi_aw_bits_id  (dc_awid),
+       .io_ddr_ctrl_axi_aw_bits_len (),
+       .io_ddr_ctrl_axi_aw_bits_size(),
+       .io_ddr_ctrl_axi_aw_bits_burst(),
+@@ -213,73 +487,77 @@ module chip_vcu118 #(
+       .io_ddr_ctrl_axi_aw_bits_cache(),
+       .io_ddr_ctrl_axi_aw_bits_qos (),
+       .io_ddr_ctrl_axi_aw_bits_region(),
+-      .io_ddr_ctrl_axi_w_valid     (ddr_ctrl_w_valid),
+-      .io_ddr_ctrl_axi_w_ready     (1'b0),
++      .io_ddr_ctrl_axi_w_valid     (dc_wvalid),
++      .io_ddr_ctrl_axi_w_ready     (dc_wready),
+       .io_ddr_ctrl_axi_w_bits_data (),
+-      .io_ddr_ctrl_axi_w_bits_last (),
++      .io_ddr_ctrl_axi_w_bits_last (dc_wlast),
+       .io_ddr_ctrl_axi_w_bits_strb (),
+-      .io_ddr_ctrl_axi_b_valid     (1'b0),
+-      .io_ddr_ctrl_axi_b_ready     (),
+-      .io_ddr_ctrl_axi_b_bits_id   ('0),
+-      .io_ddr_ctrl_axi_b_bits_resp ('0),
+-      .io_ddr_ctrl_axi_ar_valid    (ddr_ctrl_ar_valid),
+-      .io_ddr_ctrl_axi_ar_ready    (1'b0),
++      .io_ddr_ctrl_axi_b_valid     (dc_bvalid),
++      .io_ddr_ctrl_axi_b_ready     (dc_bready),
++      .io_ddr_ctrl_axi_b_bits_id   (dc_bid),
++      .io_ddr_ctrl_axi_b_bits_resp (dc_bresp),
++      .io_ddr_ctrl_axi_ar_valid    (dc_arvalid),
++      .io_ddr_ctrl_axi_ar_ready    (dc_arready),
+       .io_ddr_ctrl_axi_ar_bits_addr(),
+       .io_ddr_ctrl_axi_ar_bits_prot(),
+-      .io_ddr_ctrl_axi_ar_bits_id  (),
+-      .io_ddr_ctrl_axi_ar_bits_len (),
++      .io_ddr_ctrl_axi_ar_bits_id  (dc_arid),
++      .io_ddr_ctrl_axi_ar_bits_len (dc_arlen),
+       .io_ddr_ctrl_axi_ar_bits_size(),
+       .io_ddr_ctrl_axi_ar_bits_burst(),
+       .io_ddr_ctrl_axi_ar_bits_lock(),
+       .io_ddr_ctrl_axi_ar_bits_cache(),
+       .io_ddr_ctrl_axi_ar_bits_qos (),
+       .io_ddr_ctrl_axi_ar_bits_region(),
+-      .io_ddr_ctrl_axi_r_valid     (1'b0),
+-      .io_ddr_ctrl_axi_r_ready     (),
+-      .io_ddr_ctrl_axi_r_bits_data ('0),
+-      .io_ddr_ctrl_axi_r_bits_id   ('0),
+-      .io_ddr_ctrl_axi_r_bits_resp ('0),
+-      .io_ddr_ctrl_axi_r_bits_last (1'b0),
+-
+-      .io_ddr_mem_axi_aw_valid     (ddr_mem_aw_valid),
+-      .io_ddr_mem_axi_aw_ready     (1'b0),
+-      .io_ddr_mem_axi_aw_bits_addr (),
+-      .io_ddr_mem_axi_aw_bits_prot (),
+-      .io_ddr_mem_axi_aw_bits_id   (),
+-      .io_ddr_mem_axi_aw_bits_len  (),
+-      .io_ddr_mem_axi_aw_bits_size (),
+-      .io_ddr_mem_axi_aw_bits_burst(),
+-      .io_ddr_mem_axi_aw_bits_lock (),
+-      .io_ddr_mem_axi_aw_bits_cache(),
+-      .io_ddr_mem_axi_aw_bits_qos  (),
+-      .io_ddr_mem_axi_aw_bits_region(),
+-      .io_ddr_mem_axi_w_valid      (ddr_mem_w_valid),
+-      .io_ddr_mem_axi_w_ready      (1'b0),
+-      .io_ddr_mem_axi_w_bits_data  (),
+-      .io_ddr_mem_axi_w_bits_last  (),
+-      .io_ddr_mem_axi_w_bits_strb  (),
+-      .io_ddr_mem_axi_b_valid      (1'b0),
+-      .io_ddr_mem_axi_b_ready      (),
+-      .io_ddr_mem_axi_b_bits_id    ('0),
+-      .io_ddr_mem_axi_b_bits_resp  ('0),
+-      .io_ddr_mem_axi_ar_valid     (ddr_mem_ar_valid),
+-      .io_ddr_mem_axi_ar_ready     (1'b0),
+-      .io_ddr_mem_axi_ar_bits_addr (),
+-      .io_ddr_mem_axi_ar_bits_prot (),
+-      .io_ddr_mem_axi_ar_bits_id   (),
+-      .io_ddr_mem_axi_ar_bits_len  (),
+-      .io_ddr_mem_axi_ar_bits_size (),
+-      .io_ddr_mem_axi_ar_bits_burst(),
+-      .io_ddr_mem_axi_ar_bits_lock (),
+-      .io_ddr_mem_axi_ar_bits_cache(),
+-      .io_ddr_mem_axi_ar_bits_qos  (),
+-      .io_ddr_mem_axi_ar_bits_region(),
+-      .io_ddr_mem_axi_r_valid      (1'b0),
+-      .io_ddr_mem_axi_r_ready      (),
+-      .io_ddr_mem_axi_r_bits_data  ('0),
+-      .io_ddr_mem_axi_r_bits_id    ('0),
+-      .io_ddr_mem_axi_r_bits_resp  ('0),
+-      .io_ddr_mem_axi_r_bits_last  (1'b0),
++      .io_ddr_ctrl_axi_r_valid     (dc_rvalid),
++      .io_ddr_ctrl_axi_r_ready     (dc_rready),
++      .io_ddr_ctrl_axi_r_bits_data (dc_rdata),
++      .io_ddr_ctrl_axi_r_bits_id   (dc_rid),
++      .io_ddr_ctrl_axi_r_bits_resp (dc_rresp),
++      .io_ddr_ctrl_axi_r_bits_last (dc_rlast),
++
++      .io_ddr_mem_axi_aw_valid(m_awvalid),
++      .io_ddr_mem_axi_aw_ready(m_awready),
++      .io_ddr_mem_axi_aw_bits_addr(m_awaddr),
++      .io_ddr_mem_axi_aw_bits_prot(m_awprot),
++      .io_ddr_mem_axi_aw_bits_id(m_awid),
++      .io_ddr_mem_axi_aw_bits_len(m_awlen),
++      .io_ddr_mem_axi_aw_bits_size(m_awsize),
++      .io_ddr_mem_axi_aw_bits_burst(m_awburst),
++      .io_ddr_mem_axi_aw_bits_lock(m_awlock),
++      .io_ddr_mem_axi_aw_bits_cache(m_awcache),
++      .io_ddr_mem_axi_aw_bits_qos(m_awqos),
++      .io_ddr_mem_axi_aw_bits_region(m_awregion),
++
++      .io_ddr_mem_axi_w_valid(m_wvalid),
++      .io_ddr_mem_axi_w_ready(m_wready),
++      .io_ddr_mem_axi_w_bits_data(m_wdata),
++      .io_ddr_mem_axi_w_bits_last(m_wlast),
++      .io_ddr_mem_axi_w_bits_strb(m_wstrb),
++
++      .io_ddr_mem_axi_b_valid(m_bvalid),
++      .io_ddr_mem_axi_b_ready(m_bready),
++      .io_ddr_mem_axi_b_bits_id(m_bid),
++      .io_ddr_mem_axi_b_bits_resp(m_bresp),
++
++      .io_ddr_mem_axi_ar_valid(m_arvalid),
++      .io_ddr_mem_axi_ar_ready(m_arready),
++      .io_ddr_mem_axi_ar_bits_addr(m_araddr),
++      .io_ddr_mem_axi_ar_bits_prot(m_arprot),
++      .io_ddr_mem_axi_ar_bits_id(m_arid),
++      .io_ddr_mem_axi_ar_bits_len(m_arlen),
++      .io_ddr_mem_axi_ar_bits_size(m_arsize),
++      .io_ddr_mem_axi_ar_bits_burst(m_arburst),
++      .io_ddr_mem_axi_ar_bits_lock(m_arlock),
++      .io_ddr_mem_axi_ar_bits_cache(m_arcache),
++      .io_ddr_mem_axi_ar_bits_qos(m_arqos),
++      .io_ddr_mem_axi_ar_bits_region(m_arregion),
++
++      .io_ddr_mem_axi_r_valid(m_rvalid),
++      .io_ddr_mem_axi_r_ready(m_rready),
++      .io_ddr_mem_axi_r_bits_data(m_rdata),
++      .io_ddr_mem_axi_r_bits_id(m_rid),
++      .io_ddr_mem_axi_r_bits_resp(m_rresp),
++      .io_ddr_mem_axi_r_bits_last(m_rlast),
+ 
+       .io_dm_req_valid       (dm_req_valid),
+       .io_dm_req_ready       (dm_req_ready),
+@@ -293,3 +571,86 @@ module chip_vcu118 #(
+   );
+ 
+ endmodule
++
++// Minimal AXI4 slave that accepts everything and answers OKAY (reads 0).
++// Stands in for the DDR controller's ECC control registers.
++module vcu118_axi_okay_slave #(
++    parameter int IdWidth   = 6,
++    parameter int DataWidth = 32
++) (
++    input  logic                 clk_i,
++    input  logic                 rst_ni,
++    input  logic                 aw_valid_i,
++    output logic                 aw_ready_o,
++    input  logic [IdWidth-1:0]   aw_id_i,
++    input  logic                 w_valid_i,
++    output logic                 w_ready_o,
++    input  logic                 w_last_i,
++    output logic                 b_valid_o,
++    input  logic                 b_ready_i,
++    output logic [IdWidth-1:0]   b_id_o,
++    output logic [1:0]           b_resp_o,
++    input  logic                 ar_valid_i,
++    output logic                 ar_ready_o,
++    input  logic [IdWidth-1:0]   ar_id_i,
++    input  logic [7:0]           ar_len_i,
++    output logic                 r_valid_o,
++    input  logic                 r_ready_i,
++    output logic [IdWidth-1:0]   r_id_o,
++    output logic [DataWidth-1:0] r_data_o,
++    output logic [1:0]           r_resp_o,
++    output logic                 r_last_o
++);
++  typedef enum logic [1:0] {WIdle, WData, WResp} wstate_e;
++  wstate_e wstate_q;
++  logic [IdWidth-1:0] wid_q, rid_q;
++  logic rbusy_q;
++  logic [7:0] rcnt_q;
++
++  assign aw_ready_o = (wstate_q == WIdle);
++  assign w_ready_o  = (wstate_q == WData);
++  assign b_valid_o  = (wstate_q == WResp);
++  assign b_id_o     = wid_q;
++  assign b_resp_o   = 2'b00;
++
++  always_ff @(posedge clk_i or negedge rst_ni) begin
++    if (!rst_ni) begin
++      wstate_q <= WIdle;
++      wid_q    <= '0;
++    end else begin
++      unique case (wstate_q)
++        WIdle: if (aw_valid_i) begin
++          wid_q    <= aw_id_i;
++          wstate_q <= WData;
++        end
++        WData: if (w_valid_i && w_last_i) wstate_q <= WResp;
++        WResp: if (b_ready_i) wstate_q <= WIdle;
++        default: wstate_q <= WIdle;
++      endcase
++    end
++  end
++
++  assign ar_ready_o = !rbusy_q;
++  assign r_valid_o  = rbusy_q;
++  assign r_id_o     = rid_q;
++  assign r_data_o   = '0;
++  assign r_resp_o   = 2'b00;
++  assign r_last_o   = (rcnt_q == 8'd0);
++
++  always_ff @(posedge clk_i or negedge rst_ni) begin
++    if (!rst_ni) begin
++      rbusy_q <= 1'b0;
++      rcnt_q  <= '0;
++      rid_q   <= '0;
++    end else if (!rbusy_q) begin
++      if (ar_valid_i) begin
++        rbusy_q <= 1'b1;
++        rcnt_q  <= ar_len_i;
++        rid_q   <= ar_id_i;
++      end
++    end else if (r_ready_i) begin
++      if (rcnt_q == 8'd0) rbusy_q <= 1'b0;
++      else rcnt_q <= rcnt_q - 8'd1;
++    end
++  end
++endmodule
+diff --git a/fpga/vcu118_ddr4_c1_ip.tcl b/fpga/vcu118_ddr4_c1_ip.tcl
+new file mode 100644
+index 0000000..a832fd5
+--- /dev/null
++++ b/fpga/vcu118_ddr4_c1_ip.tcl
+@@ -0,0 +1,145 @@
++# DDR4 C1 memory controller for the VCU118 (module name: ddr4_c1).
++#
++# Nexus gets its DDR4 core from Google's internal tree (//internal/fpga/ip/ddr4);
++# the public tree only has ddr4_stub. Here we generate the equivalent core from
++# the Vivado IP catalog using the VCU118 board files, so pin locations, memory
++# part and the 250 MHz C1 system clock come from AMD's board definition rather
++# than from a hand-typed XDC.
++#
++# The SoC side (coralnpu_soc io_ddr_mem_axi_*) is AXI4, 256-bit data, 1-bit ID,
++# clocked by the controller's ui_clk, exactly as on Nexus. ECC is off, so the
++# controller has no AXI-lite ctrl port; chip_vcu118 answers the SoC's ddr_ctrl
++# port itself.
++#
++# Usage (inside an open project):  source ddr4_c1_ip.tcl; vcu118_ddr4_c1 <ipdir>
++# Prints one "DDR4C1:" line per decision so a build log shows what was chosen.
++
++proc vcu118_ddr4_c1_log {msg} { puts "DDR4C1: $msg" }
++
++proc vcu118_ddr4_c1_try {ip prop val} {
++    if {[catch {set_property $prop $val $ip} err]} {
++        vcu118_ddr4_c1_log "could not set $prop=$val ($err)"
++        return 0
++    }
++    set now [get_property $prop $ip]
++    if {$now ne $val} {
++        vcu118_ddr4_c1_log "set $prop=$val but it reads back $now"
++        return 0
++    }
++    return 1
++}
++
++proc vcu118_ddr4_c1 {ipdir} {
++    # --- board part -------------------------------------------------------
++    # Board files ship with Vivado (data/xhub/boards) or are downloaded by
++    # XHub into the user's ~/.Xilinx. The FuseSoC build runs Vivado with a
++    # fake HOME, so look in the real home (~user) too.
++    set bps [lsort -dictionary [get_board_parts -quiet *vcu118*]]
++    if {[llength $bps] == 0} {
++        set cands [glob -nocomplain -types d \
++            [file join $::env(XILINX_VIVADO) data xhub boards XilinxBoardStore boards Xilinx] \
++            [file join $::env(XILINX_VIVADO) data boards board_files] \
++            [file normalize "~[exec id -un]/.Xilinx/Vivado/[version -short]/xhub/board_store/xilinx_board_store"]]
++        if {[llength $cands]} {
++            set_param board.repoPaths $cands
++            vcu118_ddr4_c1_log "board.repoPaths $cands"
++            set bps [lsort -dictionary [get_board_parts -quiet *vcu118*]]
++        }
++    }
++    if {[llength $bps] == 0} {
++        error "DDR4C1: no VCU118 board files in this Vivado (get_board_parts *vcu118* is empty)"
++    }
++    set bp [lindex $bps end]
++    set_property board_part $bp [current_project]
++    vcu118_ddr4_c1_log "board_part $bp"
++
++    # --- board interfaces ---------------------------------------------------
++    set all_ifs [get_board_part_interfaces -quiet *]
++    set ddr_if ""
++    foreach i $all_ifs {
++        if {[string match -nocase *ddr4*c1* $i]} { set ddr_if $i; break }
++    }
++    if {$ddr_if eq ""} {
++        error "DDR4C1: no ddr4 C1 board interface; have: $all_ifs"
++    }
++    vcu118_ddr4_c1_log "memory interface $ddr_if"
++
++    # --- create -------------------------------------------------------------
++    if {[llength [get_ips -quiet ddr4_c1]] == 0} {
++        file mkdir $ipdir
++        create_ip -name ddr4 -vendor xilinx.com -library ip -module_name ddr4_c1 -dir $ipdir
++    }
++    set ip [get_ips ddr4_c1]
++    set_property CONFIG.C0_DDR4_BOARD_INTERFACE $ddr_if $ip
++
++    # The board preset normally picks the matching sys clock; set it
++    # explicitly when the board has an obvious C1 clock interface.
++    set clk_if ""
++    foreach i $all_ifs {
++        if {[string match -nocase *c1*clk* $i] || [string match -nocase *clk*c1* $i] ||
++            [string match -nocase *250mhz_clk1* $i]} { set clk_if $i; break }
++    }
++    if {$clk_if ne ""} {
++        vcu118_ddr4_c1_try $ip CONFIG.C0_CLOCK_BOARD_INTERFACE $clk_if
++    }
++
++    # --- width and speed ----------------------------------------------------
++    # The controller's AXI width is fixed at 8 x DQ width (64-bit DQ -> 512).
++    # The SoC port is 256 bits (as on Nexus), so use 32 of C1's 64 DQ bits:
++    # 1 GB instead of 2 GB, half the bandwidth, which the 50 MHz core cannot
++    # use anyway, and no width converter. If the board preset refuses, the
++    # caller adds an AXI upsizer instead (vcu118_ddr4_c1_axi_up).
++    vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_AxiSelection true
++    vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_Ecc false
++    vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_DataWidth 32
++    vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_AxiDataWidth 256
++    vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_AxiIDWidth 4
++    vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_AxiNarrowBurst true
++    # The preset runs C1 at DDR4-2400 (ui_clk 300 MHz). 1000 ps (ui_clk
++    # 250 MHz) would give the SoC's DDR-side CDC more margin.
++    vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_TimePeriod 1000
++
++    foreach p {C0_DDR4_BOARD_INTERFACE C0_CLOCK_BOARD_INTERFACE C0.DDR4_MemoryPart
++               C0.DDR4_MemoryType C0.DDR4_DataWidth C0.DDR4_Ecc C0.DDR4_TimePeriod
++               C0.DDR4_InputClockPeriod C0.DDR4_AxiSelection C0.DDR4_AxiDataWidth
++               C0.DDR4_AxiIDWidth C0.DDR4_AxiAddressWidth C0.DDR4_AxiNarrowBurst} {
++        vcu118_ddr4_c1_log "$p = [get_property -quiet CONFIG.$p $ip]"
++    }
++    return $ip
++}
++
++# SoC master (256 bit, main clock) -> controller slave (512 bit, ui_clk).
++# Packet FIFO with asynchronous clock conversion, so the SoC's DDR side stays
++# on the 50 MHz main clock and only this IP and the controller see 300 MHz.
++proc vcu118_ddr4_c1_axi_up {ipdir mi_width} {
++    if {[llength [get_ips -quiet ddr4_c1_axi_up]] == 0} {
++        create_ip -name axi_dwidth_converter -vendor xilinx.com -library ip \
++            -module_name ddr4_c1_axi_up -dir $ipdir
++    }
++    set ip [get_ips ddr4_c1_axi_up]
++    foreach {p v} [list PROTOCOL AXI4 SI_DATA_WIDTH 256 MI_DATA_WIDTH $mi_width \
++                        ADDR_WIDTH 31 SI_ID_WIDTH 4 FIFO_MODE 2 ACLK_ASYNC 1] {
++        if {![vcu118_ddr4_c1_try $ip CONFIG.$p $v]} {
++            error "DDR4C1: axi_up needs $p=$v (chip_vcu118.sv is written for it)"
++        }
++    }
++    foreach p {PROTOCOL SI_DATA_WIDTH MI_DATA_WIDTH ADDR_WIDTH SI_ID_WIDTH FIFO_MODE ACLK_ASYNC SYNCHRONIZATION_STAGES} {
++        vcu118_ddr4_c1_log "axi_up $p = [get_property -quiet CONFIG.$p $ip]"
++    }
++    return $ip
++}
++
++# Everything chip_vcu118.sv instantiates. Stops the build at once if the
++# controller does not come out the way the RTL is wired for.
++proc vcu118_ddr4_c1_all {ipdir} {
++    set ip [vcu118_ddr4_c1 $ipdir]
++    foreach {p v} {C0.DDR4_AxiSelection true C0.DDR4_DataWidth 64 C0.DDR4_AxiDataWidth 512
++                   C0.DDR4_AxiIDWidth 4 C0.DDR4_AxiAddressWidth 31 C0.DDR4_Ecc false} {
++        set now [get_property CONFIG.$p $ip]
++        if {$now ne $v} {
++            error "DDR4C1: ddr4_c1 has $p=$now, chip_vcu118.sv expects $v"
++        }
++    }
++    set up [vcu118_ddr4_c1_axi_up $ipdir 512]
++    return [list $ip $up]
++}
+diff --git a/fpga/vcu118_setup_hooks.tcl b/fpga/vcu118_setup_hooks.tcl
+index b365ad4..789242b 100644
+--- a/fpga/vcu118_setup_hooks.tcl
++++ b/fpga/vcu118_setup_hooks.tcl
+@@ -50,6 +50,10 @@ if {$changed} {
+     set_property generic $new_generics [get_filesets sources_1]
+ }
+ 
++# DDR4 C1 controller + AXI width/clock converter (instantiated by chip_vcu118).
++source "${workroot}/vcu118_ddr4_c1_ip.tcl"
++vcu118_ddr4_c1_all "${workroot}/ip"
++
+ # Register optimization, placement quality gate, and post-route assessment hooks
+ set_property STEPS.OPT_DESIGN.TCL.PRE "${workroot}/vcu118_pre_opt_hooks.tcl" [get_runs impl_1]
+ set_property STEPS.PLACE_DESIGN.TCL.POST "${workroot}/vivado_post_place_hooks.tcl" [get_runs impl_1]
+-- 
+2.43.0
+

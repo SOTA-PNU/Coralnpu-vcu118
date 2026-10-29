@@ -359,7 +359,7 @@ cmd_up() {
       cat "${log}"
       local other
       other="$(ls /dev/ttyUSB* 2>/dev/null | grep -vx "${dev}" | head -n1)"
-      die "no banner on ${dev}. Check LEDs (0 on = clock locked, 1 blinking, 7:4 walking = ROM running); other CP2105 port: UART_DEV=${other:-/dev/ttyUSB0} ./coral up"
+      die "no banner on ${dev}. Check LEDs (0 on = clock locked, 1 blinking, 6:4 walking = ROM running, 7 = DDR4 calibrated); other CP2105 port: UART_DEV=${other:-/dev/ttyUSB0} ./coral up"
     fi
   fi
 
