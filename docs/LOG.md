@@ -162,6 +162,7 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 
 - (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음
 - 빌드 전용 PC 확보 (메모리 64 GB 이상, VBS 없음)
+- (급하지 않음) 보드를 학교 Linux 서버 PC 로 이전: `tools/setup-board-host.sh` → 보드 USB·전원 이동 → VM 에서 .bit / openocd cfg / ~/models 복사 → `coral program`, `coral model`
 - 보드에 올린 ELF 에 벡터 명령이 실제로 들어 있는지 objdump 로 확인
 - 행렬곱 커널 최적화 (레지스터 블로킹), 신경망 레이어 단위 측정
 - JTAG 적재 속도 개선
