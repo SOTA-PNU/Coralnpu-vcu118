@@ -265,13 +265,25 @@ cmd_run() {
 }
 
 # ---------------------------------------------------------------------------
+# Programming needs no license: full Vivado or the free Vivado Lab Edition
+# (vivado_lab) both work. A board-only host usually has just the latter.
+prog_vivado() {
+  if command -v vivado >/dev/null; then echo vivado; return; fi
+  if command -v vivado_lab >/dev/null; then echo vivado_lab; return; fi
+  local s
+  for s in /tools/Xilinx/*/Vivado_Lab/settings64.sh /tools/Xilinx/Vivado_Lab/*/settings64.sh; do
+    [[ -f "${s}" ]] && { echo "bash -c 'source ${s} >/dev/null; exec vivado_lab \"\$@\"' vivado_lab"; return; }
+  done
+  die "neither vivado nor vivado_lab found. Install Vivado Lab Edition (free) or source its settings64.sh"
+}
+
 cmd_program() {
-  need_vivado
   local bit="${1:-${OUT}/chip_vcu118_${CONFIG}.bit}"
   [[ -f "${bit}" ]] || die "bitstream not found: ${bit} (run ./coral build)"
   info "programming ${bit} via hw_server ${HW_SERVER}"
-  (cd "${OUT}" && vivado -mode batch -nojournal -nolog -notrace \
-      -source "${ROOT}/vivado/program.tcl" -tclargs "${bit}" "${HW_SERVER}")
+  local v; v="$(prog_vivado)"
+  (cd "${OUT}" && eval "${v}" -mode batch -nojournal -nolog -notrace \
+      -source "\"${ROOT}/vivado/program.tcl\"" -tclargs "\"${bit}\"" "${HW_SERVER}")
   # A local hw_server keeps the USB-JTAG open; OpenOCD needs it free.
   # (only our own: on a shared server other users may run hw_server too)
   if [[ "${HW_SERVER}" == localhost:* ]]; then pkill -u "$(id -u)" -x hw_server 2>/dev/null || true; fi

@@ -150,6 +150,14 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
   - 패치 0001~0009 가 상류 15573b6 에 깨끗이 적용되는 것 확인
   - IP 설정이 RTL 과 다르면 setup 훅에서 바로 중단
 
+## [10/29] 보드를 학교 Linux 서버 PC 로 옮기기
+
+- 빌드(라이선스)는 이 PC 의 VM 에 그대로 두고, 서버 PC 는 보드 연결·적재·실행만 맡음
+  - ZCU102 는 ARM + 리눅스가 SD 로 스스로 부팅했지만, VCU118 은 USB 로 연결된 호스트가 항상 필요함
+- `tools/setup-board-host.sh`: 실행 전용 설치 (openocd, udev, Vivado Lab Edition, 케이블 드라이버, 파일 확인)
+- `coral program`: 라이선스가 필요 없는 `vivado_lab` 으로도 동작
+- 모델 ELF 는 VM `~/models` 에 복사됨 (Windows → VM: `scp -P 2222`, NAT 포트 전달 127.0.0.1:2222)
+
 ## [진행 예정]
 
 - (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음
