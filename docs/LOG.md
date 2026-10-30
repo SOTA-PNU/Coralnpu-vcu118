@@ -183,6 +183,15 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 - `patches/0010`: 비트스트림 쓰기 전/후 훅으로 매 빌드 자동 삽입
 - `./coral ddr4-fw`: 이미 만든 비트스트림에 펌웨어만 넣기 (재빌드 없음, 약 15분)
 
+## [10/30 오후] 펌웨어를 넣어도 보정 안 됨 → 진단 빌드
+
+- `coral ddr4-fw` 성공 (MMI: 64 KB + 32 KB 뱅크, 0..98303), 보드 적재 후에도 LED 7 꺼짐, CPU_RESET 후에도 동일
+- Vivado MIG 상태 레지스터는 여전히 비어 있음. 단, 우리 설계는 MIG 디버그 클럭(dbg_clk)을 디버그 허브에 연결하지 않아 이 값은 믿을 수 없음
+- LED 0 켜짐, LED 1 깜빡임, 부트 ROM 정상 → 코어 쪽 정상, 문제는 DDR4 컨트롤러 안쪽
+- `patches/0011` 진단 빌드: LED 5 = ui_clk 동작, LED 6 = 컨트롤러 리셋 해제, LED 7 = 보정 완료; GPIO 입력 비트 1 = 리셋 해제; 디버그 허브를 dbg_clk 로 연결(MIG 예제 설계 방식)해 보정 단계 확인 가능
+- `coral program` 이 cs_server 도 종료 (남은 cs_server 가 CPU 100% 를 계속 쓰던 문제)
+- VM 보안 점검: SSH 로그인은 모두 10.0.2.2(호스트 PC), crontab·authorized_keys 없음. 채굴 침해는 다른 Linux 기기(actions-runner) 쪽으로 보임
+
 ## [진행 예정]
 
 - (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음

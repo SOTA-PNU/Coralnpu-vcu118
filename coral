@@ -288,7 +288,11 @@ cmd_program() {
       -source "\"${ROOT}/vivado/program.tcl\"" -tclargs "\"${bit}\"" "${HW_SERVER}")
   # A local hw_server keeps the USB-JTAG open; OpenOCD needs it free.
   # (only our own: on a shared server other users may run hw_server too)
-  if [[ "${HW_SERVER}" == localhost:* ]]; then pkill -u "$(id -u)" -x hw_server 2>/dev/null || true; fi
+  # cs_server too: left behind it can spin at 100% CPU for hours (seen 10/30).
+  if [[ "${HW_SERVER}" == localhost:* ]]; then
+    pkill -u "$(id -u)" -x hw_server 2>/dev/null || true
+    pkill -u "$(id -u)" -x cs_server 2>/dev/null || true
+  fi
 }
 
 # ---------------------------------------------------------------------------

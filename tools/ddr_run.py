@@ -146,7 +146,7 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss):
     w("  if {[mbx 16] == %d} { set ok 1; break }" % STATE_READY)
     w("  resume")
     w("}")
-    w("if {!$ok} { error \"DDRLOAD: DDR not calibrated after 5 s (LED 7 off?)\" }")
+    w("if {!$ok} { error \"DDRLOAD: DDR not calibrated after 5 s. LEDs: 5 blinking = controller clock, 6 on = out of reset, 7 on = calibrated\" }")
     w("echo \"DDRLOAD: DDR calibrated\"")
 
     total = sum(len(s["data"]) for s in ddr)

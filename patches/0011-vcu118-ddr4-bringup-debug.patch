@@ -1,0 +1,128 @@
+From 67394cbdcb30f9a9a3b3a1117dbdf5ed189f2656 Mon Sep 17 00:00:00 2001
+From: donghun <ehdgns1083@pusan.ac.kr>
+Date: Fri, 30 Oct 2026 15:50:47 +0900
+Subject: [PATCH] fpga/vcu118: DDR4 bring-up visibility (LEDs, GPIO, MIG debug
+ hub clock)
+
+On the board the controller never reports calibration (LED 7 off, also after
+CPU_RESET) and Vivado reads empty MIG status registers. To tell a missing
+reference clock, a held reset and a failing calibration apart:
+  LED 5 blinks from ui_clk, LED 6 = controller out of reset, LED 7 = calibrated
+  GPIO input bit 1 = controller out of reset (bit 0 stays calibration)
+  the debug hub is clocked by the controller's dbg_clk, as in the MIG
+  example design, so the hardware manager can show the calibration stages.
+LED 4 keeps the boot ROM's GPIO 0.
+---
+ fpga/pins_vcu118.xdc    |  8 ++++++++
+ fpga/rtl/chip_vcu118.sv | 35 +++++++++++++++++++++++++++++------
+ 2 files changed, 37 insertions(+), 6 deletions(-)
+
+diff --git a/fpga/pins_vcu118.xdc b/fpga/pins_vcu118.xdc
+index eb654d3..0bd0630 100644
+--- a/fpga/pins_vcu118.xdc
++++ b/fpga/pins_vcu118.xdc
+@@ -54,5 +54,13 @@ set_clock_groups -asynchronous \
+   -group [get_clocks -include_generated_clocks sysclk_125] \
+   -group [get_clocks jtag_tck]
+ 
++## DDR4 calibration debug: clock the Vivado debug hub with the controller's
++## dbg_clk (as the MIG example design does), so the hardware manager can read
++## the calibration status registers. Without it they read back empty.
++set_property C_CLK_INPUT_FREQ_HZ 300000000 [get_debug_cores dbg_hub]
++set_property C_ENABLE_CLK_DIVIDER false [get_debug_cores dbg_hub]
++set_property C_USER_SCAN_CHAIN 1 [get_debug_cores dbg_hub]
++connect_debug_port dbg_hub/clk [get_nets ddr_dbg_clk]
++
+ ## Bitstream settings
+ set_property BITSTREAM.GENERAL.COMPRESS TRUE [current_design]
+diff --git a/fpga/rtl/chip_vcu118.sv b/fpga/rtl/chip_vcu118.sv
+index 968c9c8..04e3ba3 100644
+--- a/fpga/rtl/chip_vcu118.sv
++++ b/fpga/rtl/chip_vcu118.sv
+@@ -36,7 +36,12 @@
+ //            the bus until calibration ends).
+ //   * SPI device / SPI host / SPI flash / I2C / camera: not connected.
+ //   * LEDs: [0] MMCM locked [1] heartbeat [2] io_halted [3] io_fault
+-//           [6:4] SoC GPIO[2:0] [7] DDR4 calibrated
++//           [4] SoC GPIO[0] (boot ROM)
++//           DDR4 bring-up, readable without any software:
++//           [5] blinks when the controller's ui_clk (300 MHz) runs
++//           [6] on when the controller is out of reset (ui_clk_sync_rst low)
++//           [7] on when calibration is complete
++//   * GPIO inputs: [0] calibration complete [1] controller out of reset
+ module chip_vcu118 #(
+     parameter MemInitFile = "",
+     parameter int ClockFrequencyMhz = 50,
+@@ -108,7 +113,14 @@ module chip_vcu118 #(
+   // ------------------------------------------------------------------
+   logic [7:0] gpio_out, gpio_en;
+   logic io_halted, io_fault;
+-  logic ddr_calib, ddr_calib_sync;
++  logic ddr_calib, ddr_calib_sync, ddr_run_sync;
++  logic ui_clk, ui_rst;
++  // MIG debug clock, wired to the Vivado debug hub in pins_vcu118.xdc so the
++  // hardware manager can show the calibration stages (as the MIG example
++  // design does). keep: the XDC refers to this net by name.
++  (* keep = "true" *) logic ddr_dbg_clk;
++  logic [27:0] ui_hb_q = '0;
++  always_ff @(posedge ui_clk) ui_hb_q <= ui_hb_q + 28'd1;
+ 
+   // ~1.5 Hz at 50 MHz: proves the main clock is alive without any software.
+   logic [24:0] heartbeat_q;
+@@ -121,7 +133,9 @@ module chip_vcu118 #(
+   assign led[1]   = heartbeat_q[24];
+   assign led[2]   = io_halted;
+   assign led[3]   = io_fault;
+-  assign led[6:4] = gpio_out[2:0] & gpio_en[2:0];
++  assign led[4]   = gpio_out[0] & gpio_en[0];
++  assign led[5]   = ui_hb_q[27];
++  assign led[6]   = ~ui_rst;
+   assign led[7]   = ddr_calib;
+ 
+   // ------------------------------------------------------------------
+@@ -174,7 +188,6 @@ module chip_vcu118 #(
+   logic [3:0]   up_bid, up_rid;
+ 
+   // Controller side, ui_clk (300 MHz)
+-  logic         ui_clk, ui_rst;
+   logic [30:0]  c_awaddr, c_araddr;
+   logic [7:0]   c_awlen, c_arlen;
+   logic [2:0]   c_awsize, c_arsize, c_awprot, c_arprot;
+@@ -215,7 +228,7 @@ module chip_vcu118 #(
+       .c0_sys_clk_p           (c0_sys_clk_p),
+       .c0_sys_clk_n           (c0_sys_clk_n),
+       .c0_init_calib_complete (ddr_calib),
+-      .dbg_clk                (),
++      .dbg_clk                (ddr_dbg_clk),
+       .dbg_bus                (),
+       .addn_ui_clkout1        (),
+       .c0_ddr4_act_n          (c0_ddr4_act_n),
+@@ -369,6 +382,16 @@ module chip_vcu118 #(
+       .dest_out(ddr_calib_sync)
+   );
+ 
++  xpm_cdc_single #(
++      .DEST_SYNC_FF  (3),
++      .SRC_INPUT_REG (0)
++  ) i_ddr_run_sync (
++      .src_clk (1'b0),
++      .src_in  (~ui_rst),
++      .dest_clk(clk),
++      .dest_out(ddr_run_sync)
++  );
++
+   // AXI-lite DDR control port (ECC registers on Nexus): answer OKAY / 0.
+   logic        dc_awvalid, dc_awready, dc_wvalid, dc_wready, dc_wlast;
+   logic        dc_bvalid, dc_bready, dc_arvalid, dc_arready;
+@@ -444,7 +467,7 @@ module chip_vcu118 #(
+       .spim_flash_rst_no(),
+       .gpio_o           (gpio_out),
+       .gpio_en_o        (gpio_en),
+-      .gpio_i           ({7'h00, ddr_calib_sync}),
++      .gpio_i           ({6'h00, ddr_run_sync, ddr_calib_sync}),
+       // Camera / ISP: no sensor on this board
+       .ISP_DVP_D0       (1'b0),
+       .ISP_DVP_D1       (1'b0),
+-- 
+2.43.0
+
