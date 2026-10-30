@@ -50,6 +50,7 @@ BUF_MAX = 0x100000 - BUF
 ITCM_END = 0x100000
 DTCM = (0x100000, 0x200000)
 DDR_BASE = 0x80000000
+GPIO_IN = 0x40030000    # SoC GPIO DATA_IN: bit0 calib done, bit1 ctrl out of reset
 RET_SENTINEL = 0x0BADD00D   # what the crt0 stores in _ret before main()
 
 # DTCM symbols worth reading back, in print order.
@@ -146,7 +147,15 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss):
     w("  if {[mbx 16] == %d} { set ok 1; break }" % STATE_READY)
     w("  resume")
     w("}")
-    w("if {!$ok} { error \"DDRLOAD: DDR not calibrated after 5 s. LEDs: 5 blinking = controller clock, 6 on = out of reset, 7 on = calibrated\" }")
+    # On timeout, read the SoC GPIO input register before giving up:
+    #   bit 0 = DDR init_calib_complete, bit 1 = controller out of reset
+    # (patches/0011 wired bit 1). Three samples so a toggling bit shows up.
+    w("if {!$ok} {")
+    w("  catch {halt}")
+    w("  echo \"DDRLOAD: GPIO DATA_IN %#x (bit0=calib, bit1=ctrl out of reset), 3 samples:\"" % GPIO_IN)
+    w("  for {set j 0} {$j < 3} {incr j} { catch {mdw %#x}; sleep 50 }" % GPIO_IN)
+    w("  error \"DDRLOAD: DDR not calibrated after 5 s. LEDs: 5 blinking = controller clock, 6 on = out of reset, 7 on = calibrated\"")
+    w("}")
     w("echo \"DDRLOAD: DDR calibrated\"")
 
     total = sum(len(s["data"]) for s in ddr)
