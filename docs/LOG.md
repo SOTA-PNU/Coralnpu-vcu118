@@ -158,6 +158,17 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 - `coral program`: 라이선스가 필요 없는 `vivado_lab` 으로도 동작
 - 모델 ELF 는 VM `~/models` 에 복사됨 (Windows → VM: `scp -P 2222`, NAT 포트 전달 127.0.0.1:2222)
 
+## [10/30] 원격 자동화: VM 메일박스 에이전트
+
+- 문제: 연구실 밖에서는 VM 상태를 볼 수 없고, Claude 도 Windows `SOTA` 폴더까지만 닿음
+- `tools/vm-agent.sh`: VirtualBox 공유 폴더(`SOTA\vmshare` ↔ VM `/media/sf_coral`)를 통해
+  - `status.txt` 를 1분마다 갱신 (빌드 진행 단계, 메모리, 최신 summary)
+  - `inbox/*.job` 의 명령을 실행하고 결과를 `outbox/` 에 남김
+  - 허용 명령만 실행: status, pull, build, resume, program, model, probe, cancel (나머지는 거부)
+- `tools/overnight.sh`
+  - 타이밍 요약을 제대로 기록 (constraints met 여부, 클럭별 WNS/WHS, LUT)
+  - vector_highmem 이면 빌드·회귀 뒤 `~/models` 의 lenet5 → charrnn → yolo → vgg 를 자동 실행 (첫 실패에서 중단)
+
 ## [진행 예정]
 
 - (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음

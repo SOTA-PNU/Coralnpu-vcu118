@@ -29,10 +29,33 @@ fi
 note "swap: $(free -g | awk '/Swap/ {print $2 " GB total"}')"
 
 if step build env CONFIG="${CFG}" ./coral build; then
-  grep -m1 -A3 "WNS(ns)" out/reports_"${CFG}"/*timing*.rpt 2>/dev/null | tail -1 | sed 's/^/      timing WNS..: /' >> "${S}"
+  R="out/reports_${CFG}"
+  T="$(ls "${R}"/*timing_summary_postroute_physopted.rpt "${R}"/*timing_summary_routed.rpt 2>/dev/null | head -n1)"
+  if [[ -n "${T}" ]]; then
+    {
+      echo "      timing ($(basename "${T}")): $(grep -h -m1 "timing constraints are" "${T}")"
+      echo "      WNS TNS #fail ... WHS: $(grep -h -m1 -A2 "WNS(ns)" "${T}" | tail -n1 | awk '{print $1, $2, $3, "...", $5}')"
+      awk '/Intra Clock Table/,/Inter Clock Table/' "${T}" | grep -E "^\s*[a-z_]" | awk '{printf "      clock %-28s WNS %s WHS %s\n", $1, $2, $6}'
+    } >> "${S}"
+  fi
+  grep -h -E "^\| CLB LUTs " "${R}"/*utilization_placed.rpt 2>/dev/null | sed 's/^/      /' >> "${S}"
   step up     env CONFIG="${CFG}" ./coral up
   step rvv    ./coral run out/vcu118_rvv_test${SFX}.elf;     result rvv
   step matmul ./coral run out/vcu118_matmul_bench${SFX}.elf; result matmul
+  # IREE model ELFs in ~/models need the DDR4 (highmem) build; smallest first,
+  # stop at the first failure (the rest would fail the same way).
+  if [[ "${CFG}" == vector_highmem && -d "${HOME}/models" ]]; then
+    for m in lenet5 charrnn yolo vgg; do
+      [[ -f "${HOME}/models/${m}" ]] || continue
+      if step "model_${m}" ./coral model "${HOME}/models/${m}" --timeout 3600; then
+        grep -aE "DDRLOAD: (checksum|finished)|^    (_ret|inference_status|inference_argmax|inference_out_count|cyc_invoke) |total" \
+          "${D}/model_${m}.log" | sed 's/^/      /' >> "${S}" || true
+      else
+        tail -15 "${D}/model_${m}.log" | sed 's/^/      /' >> "${S}"
+        break
+      fi
+    done
+  fi
 else
   tail -30 "${D}/build.log" | sed 's/^/      /' >> "${S}"
 fi
