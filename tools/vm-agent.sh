@@ -22,8 +22,13 @@
 #   model <name> [--timeout N]    ./coral model ~/models/<name>
 #   probe                         ./coral ddr4-probe
 #   cancel                        stop a running overnight/build (asks Vivado to quit)
+#   update                        fast-forward the repo from the newest bundles/*.bundle
+#                                 in the shared folder (no GitHub needed; same commits
+#                                 GitHub gets later, so the histories stay identical)
+#   log <step> [lines]            tail of ~/overnight/<latest>/<step>.log (build, up, rvv,
+#                                 matmul, model_lenet5, ...); default 60 lines
 set -u
-ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+ROOT="${CORAL_ROOT:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}"
 SHARE="${CORAL_SHARE:-/media/sf_coral}"
 LOCK="${HOME}/.cache/coral-vm-agent.lock"
 VIVADO_SETTINGS="${VIVADO_SETTINGS:-/tools/Xilinx/2026.1/Vivado/settings64.sh}"
@@ -109,6 +114,30 @@ run_job() {  # run_job <words...>; output on stdout
     probe)
       vivado_env
       (cd "${ROOT}" && ./coral ddr4-probe) ;;
+    update)
+      local b
+      b="$(ls -t "${SHARE}"/bundles/*.bundle 2>/dev/null | head -n1)"
+      [[ -n "${b}" ]] || { echo "no ${SHARE}/bundles/*.bundle"; return 2; }
+      [[ -z "$(git -C "${ROOT}" status --porcelain --untracked-files=no)" ]] ||
+        { echo "repo has local changes; refusing"; git -C "${ROOT}" status --short; return 1; }
+      local tmpb; tmpb="$(mktemp --suffix=.bundle)"
+      cp -f "${b}" "${tmpb}"
+      echo "bundle $(basename "${b}")"
+      git -C "${ROOT}" bundle verify "${tmpb}" >/dev/null &&
+        git -C "${ROOT}" fetch -q "${tmpb}" main &&
+        git -C "${ROOT}" merge --ff-only FETCH_HEAD
+      local rc=$?
+      rm -f "${tmpb}"
+      git -C "${ROOT}" log --oneline -3
+      if building; then echo "note: a build is running; it keeps the scripts it already started with"; fi
+      return ${rc} ;;
+    log)
+      [[ "${1:-}" =~ ${name_re} ]] || { echo "usage: log <step> [lines]"; return 2; }
+      local d n=60
+      [[ "${2:-}" =~ ^[0-9]+$ ]] && n="$2"
+      d="$(latest_overnight)"
+      [[ -f "${d}$1.log" ]] || { echo "no ${d}$1.log; have:"; ls "${d}"; return 2; }
+      tail -n "${n}" "${d}$1.log" | sed 's/\r//' ;;
     cancel)
       pkill -u "$(id -u)" -f "tools/overnight.sh" ; pkill -u "$(id -u)" -x vivado
       echo "sent stop to overnight.sh and vivado" ;;
@@ -117,7 +146,7 @@ run_job() {  # run_job <words...>; output on stdout
 }
 
 pass() {
-  mkdir -p "${SHARE}/inbox" "${SHARE}/outbox" "${SHARE}/done"
+  mkdir -p "${SHARE}/inbox" "${SHARE}/outbox" "${SHARE}/done" "${SHARE}/bundles"
   write_status
   local j base words rc
   for j in "${SHARE}"/inbox/*.job; do
