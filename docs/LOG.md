@@ -169,6 +169,20 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
   - 타이밍 요약을 제대로 기록 (constraints met 여부, 클럭별 WNS/WHS, LUT)
   - vector_highmem 이면 빌드·회귀 뒤 `~/models` 의 lenet5 → charrnn → yolo → vgg 를 자동 실행 (첫 실패에서 중단)
 
+## [10/30] DDR4 빌드 결과와 보정 실패 원인
+
+- 빌드 10/29 18:21 → 23:20 (약 5시간)
+- 타이밍 통과: clk_main WNS +0.084 ns, DDR4 쪽 +0.039 ns 이상
+- LUT 539,187 (45.6%)
+- 보드: RVV, matmul 회귀는 이전과 사이클까지 동일하게 PASS
+- 문제: `coral model lenet5` 가 "DDR not calibrated" 에서 멈춤. LED 7 꺼짐
+  - Vivado 하드웨어 매니저: MIG 디버그 코어는 보이지만 버전 레지스터가 비어 있음
+  - 원인: DDR4 컨트롤러 안의 보정용 MicroBlaze BRAM 에 펌웨어(`calibration_ddr.elf`)가 아니라 IP 의 빈 부트 루프가 들어가 있었음
+  - 상류 Nexus 의 `vivado_hook_write_bitstream_post.tcl` 이 바로 이 단계 (그쪽 코어 전용으로 보고 빠뜨렸던 것)
+- `write_mem_info` 는 두 번째 BRAM 뱅크(32 KB)를 빠뜨려 updatemem 실패 → BMM 정보로 MMI 를 직접 만듦
+- `patches/0010`: 비트스트림 쓰기 전/후 훅으로 매 빌드 자동 삽입
+- `./coral ddr4-fw`: 이미 만든 비트스트림에 펌웨어만 넣기 (재빌드 없음, 약 15분)
+
 ## [진행 예정]
 
 - (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음

@@ -15,6 +15,8 @@
 #                             "coral up" there (build in the licensed VM, run on fractal)
 #   ./coral model <x.elf>     run a DDR-resident program (IREE model ELF) over JTAG
 #                             and print its inference_* results (DDR4 bitstream)
+#   ./coral ddr4-fw           add the DDR4 calibration firmware to an existing
+#                             bitstream (builds before patch 0010), ~15 min
 #   ./coral ddr4-probe [synth] generate the DDR4 C1 controller IP only (minutes) and
 #                             print its settings and ports -> out/ddr4_probe.txt;
 #                             "synth" also checks every DDR pin gets placed (~20 min)
@@ -431,6 +433,33 @@ cmd_model() {
 }
 
 # ---------------------------------------------------------------------------
+# Put the DDR4 calibration firmware into an already built bitstream (builds
+# from before patches/0010 lack it: LED 7 never lights, ddr_run.py reports
+# "DDR not calibrated"). Opens the routed checkpoint (~15 min), no rebuild.
+# The original is kept as out/chip_vcu118_<CONFIG>.nofw.bit.
+cmd_ddr4_fw() {
+  need_vivado
+  local bit="${OUT}/chip_vcu118_${CONFIG}.bit" impl dcp elf
+  [[ -f "${bit}" ]] || die "no ${bit}"
+  impl="$(find "${HOME}"/.cache/bazel -path "*execroot*build_chip_vcu118_bitstream_${CONFIG}/*" -type d -name impl_1 2>/dev/null | head -n1)"
+  [[ -n "${impl}" ]] || die "no impl_1 run for ${CONFIG} under ~/.cache/bazel"
+  dcp="$(ls -t "${impl}"/*postroute_physopt*.dcp "${impl}"/*_routed.dcp 2>/dev/null | head -n1)"
+  elf="$(find "${impl}/../.." -name calibration_ddr.elf 2>/dev/null | head -n1)"
+  [[ -n "${dcp}" && -n "${elf}" ]] || die "checkpoint or calibration_ddr.elf missing in ${impl}"
+  info "checkpoint ${dcp}"
+  info "firmware   ${elf}"
+  local tmp="${OUT}/chip_vcu118_${CONFIG}.fw.bit"
+  (cd "${OUT}" && vivado -mode batch -nojournal -log ddr4_fw.log -notrace \
+      -source "${ROOT}/vivado/ddr4_fw.tcl" -tclargs "${dcp}" "${elf}" "${bit}" "${tmp}") |
+    grep -E "DDR4FW:|ERROR" || true
+  [[ -f "${tmp}" ]] || die "no firmware bitstream; see ${OUT}/ddr4_fw.log"
+  [[ -f "${OUT}/chip_vcu118_${CONFIG}.nofw.bit" ]] || cp -p "${bit}" "${OUT}/chip_vcu118_${CONFIG}.nofw.bit"
+  chmod u+w "${bit}" 2>/dev/null || true
+  mv -f "${tmp}" "${bit}"
+  info "updated ${bit}; now: ./coral program && LED 7 should light within a second"
+}
+
+# ---------------------------------------------------------------------------
 # A few minutes, no synthesis: generate the DDR4 C1 controller the way the
 # build will (same script, same fake HOME as FuseSoC) and print its config and
 # port list. Run this before a multi-hour build that adds or changes DDR4.
@@ -456,6 +485,7 @@ cmd_ddr4_probe() {
 sub="${1:-}"; shift || true
 case "${sub}" in
   ddr4-probe) cmd_ddr4_probe "$@" ;;
+  ddr4-fw)    cmd_ddr4_fw "$@" ;;
   doctor|setup|build|resume|sw|run|program|load|console|up|deploy|model) "cmd_${sub}" "$@" ;;
   *) sed -n '2,/^# Environment/p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
