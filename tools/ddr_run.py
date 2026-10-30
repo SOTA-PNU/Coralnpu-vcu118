@@ -33,15 +33,17 @@ import time
 
 # tools/ddr_stub.S assembled with llvm-mc (see the header of that file).
 STUB_WORDS = [
-    0x10000413, 0x400304b7, 0x0004a283, 0x0012f293, 0xfe028ce3, 0x0ddc12b7,
-    0xde128293, 0x00542823, 0x00042283, 0xfe028ee3, 0x00442503, 0x00842583,
-    0x00c42603, 0x00100313, 0x02628063, 0x00200313, 0x02628c63, 0x00300313,
-    0x04628463, 0x00400313, 0x06628263, 0x0700006f, 0x06060663, 0x00052383,
-    0x0075a023, 0x00450513, 0x00458593, 0xffc60613, 0xfe0616e3, 0x0500006f,
-    0x04060663, 0x0005a023, 0x00458593, 0xffc60613, 0xfe061ae3, 0x0380006f,
-    0x00000e13, 0x00060c63, 0x0005a383, 0x007e0e33, 0x00458593, 0xffc60613,
-    0xfe0618e3, 0x01c42a23, 0x0140006f, 0x00042023, 0x0ff0000f, 0x0000100f,
-    0x00058067, 0x0ff0000f, 0x00042023, 0xf55ff06f,
+    0x10000413, 0x400304b7, 0x0004a283, 0x00542c23, 0x0012f293,
+    0xfe028ae3, 0x0ddc12b7, 0xde128293, 0x00542823, 0x00042283,
+    0xfe028ee3, 0x00442503, 0x00842583, 0x00c42603, 0x00100313,
+    0x02628063, 0x00200313, 0x02628c63, 0x00300313, 0x04628463,
+    0x00400313, 0x06628263, 0x0700006f, 0x06060663, 0x00052383,
+    0x0075a023, 0x00450513, 0x00458593, 0xffc60613, 0xfe0616e3,
+    0x0500006f, 0x04060663, 0x0005a023, 0x00458593, 0xffc60613,
+    0xfe061ae3, 0x0380006f, 0x00000e13, 0x00060c63, 0x0005a383,
+    0x007e0e33, 0x00458593, 0xffc60613, 0xfe0618e3, 0x01c42a23,
+    0x0140006f, 0x00042023, 0x0ff0000f, 0x0000100f, 0x00058067,
+    0x0ff0000f, 0x00042023, 0xf55ff06f,
 ]
 MBX = 0x100            # mailbox in ITCM
 STATE_READY = 0x0DDC0DE1
@@ -50,7 +52,7 @@ BUF_MAX = 0x100000 - BUF
 ITCM_END = 0x100000
 DTCM = (0x100000, 0x200000)
 DDR_BASE = 0x80000000
-GPIO_IN = 0x40030000    # SoC GPIO DATA_IN: bit0 calib done, bit1 ctrl out of reset
+MBX_GPIO = 24          # stub publishes GPIO DATA_IN here while waiting
 RET_SENTINEL = 0x0BADD00D   # what the crt0 stores in _ret before main()
 
 # DTCM symbols worth reading back, in print order.
@@ -138,7 +140,7 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss):
     w("catch {riscv set_ebreakm off}")   # ebreak in the program traps, as on Nexus
     w("if {[catch {reset halt}]} { halt }")
     w("load_image %s 0x0 bin" % stub)
-    w("mww %d 0; mww %d 0" % (MBX, MBX + 16))
+    w("mww %d 0; mww %d 0; mww %d 0" % (MBX, MBX + 16, MBX + MBX_GPIO))
     w("echo \"DDRLOAD: stub loaded, waiting for DDR calibration\"")
     w("resume 0x0")
     w("set ok 0")
@@ -152,8 +154,8 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss):
     # (patches/0011 wired bit 1). Three samples so a toggling bit shows up.
     w("if {!$ok} {")
     w("  catch {halt}")
-    w("  echo \"DDRLOAD: GPIO DATA_IN %#x (bit0=calib, bit1=ctrl out of reset), 3 samples:\"" % GPIO_IN)
-    w("  for {set j 0} {$j < 3} {incr j} { catch {mdw %#x}; sleep 50 }" % GPIO_IN)
+    w("  set g [mbx %d]" % MBX_GPIO)
+    w("  echo [format \"DDRLOAD: GPIO DATA_IN = 0x%08x (bit0 calibrated=%d, bit1 ctrl-out-of-reset=%d)\" $g [expr {$g & 1}] [expr {($g >> 1) & 1}]]")
     w("  error \"DDRLOAD: DDR not calibrated after 5 s. LEDs: 5 blinking = controller clock, 6 on = out of reset, 7 on = calibrated\"")
     w("}")
     w("echo \"DDRLOAD: DDR calibrated\"")

@@ -7,6 +7,9 @@
 #   +4  src    +8 dst   +12 len (bytes, multiple of 4)
 #   +16 state  0x0ddc0de1 once the DDR controller reports calibration done
 #   +20 result of cmd 3 (32-bit wrapping sum of the words)
+#   +24 last GPIO DATA_IN seen while waiting for calibration, so the host can
+#       tell the three bring-up cases apart (the debug module cannot read
+#       0x40030000 itself): bit 0 calibrated, bit 1 controller out of reset
 # The stub clears cmd when a command is finished.
 # GPIO DATA_IN (0x40030000) bit 0 = DDR init_calib_complete (chip_vcu118).
 #
@@ -21,6 +24,7 @@ _start:
         li      s1, 0x40030000          # GPIO DATA_IN
 wait_cal:
         lw      t0, 0(s1)
+        sw      t0, 24(s0)              # publish raw GPIO for the debugger
         andi    t0, t0, 1
         beqz    t0, wait_cal
         li      t0, 0x0ddc0de1
