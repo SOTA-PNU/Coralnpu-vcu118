@@ -476,6 +476,16 @@ cmd_ddr4_probe() {
     export XILINXD_LICENSE_FILE="${HOME}/.Xilinx/Xilinx.lic"
   fi
   fakehome="$(mktemp -d)"
+  # The pin check ("synth") is the only thing that says which package pin the
+  # board flow actually gives c0_sys_clk_p, and nothing in the tree constrains
+  # it by hand. On the board the controller never leaves reset (GPIO bit 1 = 0)
+  # with sys_rst correctly ACTIVE_HIGH, so the reference clock is a prime
+  # suspect and this check is worth its ~20 min. "nosynth" skips it.
+  if [[ $# -eq 0 ]]; then
+    set -- synth
+  elif [[ "${1}" == nosynth ]]; then
+    shift
+  fi
   info "generating the DDR4 C1 IP in ${work} (HOME=${fakehome}, like the FuseSoC build)"
   (cd "${OUT}" && HOME="${fakehome}" vivado -mode batch -nojournal -nolog -notrace \
       -source "${ROOT}/vivado/ddr4_probe.tcl" -tclargs "${work}" "$@") 2>&1 |
