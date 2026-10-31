@@ -102,20 +102,29 @@ if {$do_synth} {
     }
     puts "PROBE: LUT [llength [get_cells -hier -filter {PRIMITIVE_GROUP == CLB && PRIMITIVE_SUBGROUP == LUT}]]"
 }
-# Reset settings as they ended up in the generated .xci, plus how the
-# instantiation template declares sys_rst.
+# How the generated IP declares sys_rst. The DDR4 IP has no polarity
+# CONFIG property, so the polarity lives in the .xci interface metadata.
 foreach x [glob -nocomplain -directory [file join $work ip ddr4_c1] *.xci] {
-    set fh [open $x r]; set t [read $fh]; close $fh
-    foreach line [split $t "\n"] {
-        if {[regexp -nocase {(rst|reset)} $line] && [regexp -nocase {polarity|sys_rst|RESET_BOARD} $line]} {
-            puts "PROBE: xci [string trim $line]"
+    set fh [open $x r]; set lines [split [read $fh] "\n"]; close $fh
+    set n [llength $lines]
+    for {set i 0} {$i < $n} {incr i} {
+        set line [string trim [lindex $lines $i]]
+        if {[string match -nocase *POLARITY* $line]} {
+            puts "PROBE: xci POLARITY-line $line"
+            for {set j [expr {$i - 6}]} {$j <= $i + 2} {incr j} {
+                if {$j >= 0 && $j < $n} {
+                    puts "PROBE: xci   ctx\[$j\] [string trim [lindex $lines $j]]"
+                }
+            }
         }
     }
-}
-foreach veo [glob -nocomplain [file join $work ip ddr4_c1 *.veo]] {
-    set fh [open $veo r]; set t [read $fh]; close $fh
-    foreach line [split $t "\n"] {
-        if {[string match -nocase *sys_rst* $line]} { puts "PROBE: veo [string trim $line]" }
+    # the RST interface block
+    for {set i 0} {$i < $n} {incr i} {
+        if {[string match {*"RST"*} [lindex $lines $i]]} {
+            for {set j $i} {$j <= $i + 14} {incr j} {
+                if {$j < $n} { puts "PROBE: xci RST\[$j\] [string trim [lindex $lines $j]]" }
+            }
+        }
     }
 }
 puts "PROBE: done"
