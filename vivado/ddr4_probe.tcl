@@ -102,4 +102,20 @@ if {$do_synth} {
     }
     puts "PROBE: LUT [llength [get_cells -hier -filter {PRIMITIVE_GROUP == CLB && PRIMITIVE_SUBGROUP == LUT}]]"
 }
+# Reset settings as they ended up in the generated .xci, plus how the
+# instantiation template declares sys_rst.
+foreach x [glob -nocomplain -directory [file join $work ip ddr4_c1] *.xci] {
+    set fh [open $x r]; set t [read $fh]; close $fh
+    foreach line [split $t "\n"] {
+        if {[regexp -nocase {(rst|reset)} $line] && [regexp -nocase {polarity|sys_rst|RESET_BOARD} $line]} {
+            puts "PROBE: xci [string trim $line]"
+        }
+    }
+}
+foreach veo [glob -nocomplain [file join $work ip ddr4_c1 *.veo]] {
+    set fh [open $veo r]; set t [read $fh]; close $fh
+    foreach line [split $t "\n"] {
+        if {[string match -nocase *sys_rst* $line]} { puts "PROBE: veo [string trim $line]" }
+    }
+}
 puts "PROBE: done"

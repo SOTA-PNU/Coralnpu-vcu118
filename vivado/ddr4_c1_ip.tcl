@@ -105,6 +105,15 @@ proc vcu118_ddr4_c1 {ipdir} {
                C0.DDR4_AxiIDWidth C0.DDR4_AxiAddressWidth C0.DDR4_AxiNarrowBurst} {
         vcu118_ddr4_c1_log "$p = [get_property -quiet CONFIG.$p $ip]"
     }
+    # Reset polarity is never set explicitly here; chip_vcu118.sv drives
+    # sys_rst = cpu_reset | ~eos, which is only correct for ACTIVE HIGH.
+    # On the board GPIO bit 1 (controller out of reset) never goes high, so
+    # log every reset-ish property to see which polarity the IP took.
+    foreach p [lsort [list_property $ip]] {
+        if {[string match -nocase *rst* $p] || [string match -nocase *reset* $p]} {
+            vcu118_ddr4_c1_log "RESETPROP $p = [get_property -quiet $p $ip]"
+        }
+    }
     return $ip
 }
 
