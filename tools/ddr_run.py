@@ -155,7 +155,11 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss):
     w("if {!$ok} {")
     w("  catch {halt}")
     w("  set g [mbx %d]" % MBX_GPIO)
-    w("  echo [format \"DDRLOAD: GPIO DATA_IN = 0x%08x (bit0 calibrated=%d, bit1 ctrl-out-of-reset=%d)\" $g [expr {$g & 1}] [expr {($g >> 1) & 1}]]")
+    w("  echo [format \"DDRLOAD: GPIO DATA_IN = 0x%08x  calibrated=%d  ctrl-out-of-reset=%d  eos=%d  por-held=%d\" $g [expr {$g & 1}] [expr {($g >> 1) & 1}] [expr {($g >> 2) & 1}] [expr {($g >> 3) & 1}]]")
+    # bits 2/3 exist only from patches/0012 on; on an older bitstream they read 0.
+    w("  if {($g & 8) == 0 && ($g & 2) == 0} {")
+    w("    echo \"DDRLOAD: power-on reset already released but the controller is still in reset -> the 250 MHz reference clock is not reaching the IP (or this bitstream predates patches/0012)\"")
+    w("  }")
     w("  error \"DDRLOAD: DDR not calibrated after 5 s. LEDs: 5 blinking = controller clock, 6 on = out of reset, 7 on = calibrated\"")
     w("}")
     w("echo \"DDRLOAD: DDR calibrated\"")
