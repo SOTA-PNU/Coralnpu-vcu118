@@ -5,7 +5,10 @@
 #   3. with "synth": a tiny top with only the controller is synthesized and
 #      every DDR4/clock pin must come out placed (PACKAGE_PIN + IOSTANDARD)
 #      by the board flow. ~20 min.
-# Run via "coral ddr4-probe [synth]". Output lines start with PROBE: or DDR4C1:.
+# Run via "coral ddr4-probe [synth]". Output lines start with PROBE: or DDR4C1:
+# (coral greps for exactly those two prefixes, so every new line needs one).
+# "PROBE: CLK" lines answer one question: does the IP believe its reference
+# clock is the board's 250 MHz (4000 ps), or something else?
 
 set here [file dirname [file normalize [info script]]]
 set work [lindex $argv 0]
@@ -49,6 +52,53 @@ foreach x [glob -nocomplain -directory [file join $work ip ddr4_c1] -types f */*
     set n [regexp -all -line {BOARD_PART_PIN|BOARD_PIN|PACKAGE_PIN} $t]
     puts "PROBE: xdc [file tail $x] board/pin lines $n"
     incr nbp $n
+}
+
+# --- reference clock: what the IP thinks it is given -------------------------
+# The board drives c0_sys_clk at 250 MHz = 4000 ps. probe already showed
+# DDR4_TimePeriod snapping 1000 -> 833 and DDR4_InputClockPeriod = 14161
+# (= 17 x 833, about 70.6 MHz). If that number is what programs the IP's
+# internal MMCM, the MMCM is told to expect ~70 MHz on a 250 MHz pin, never
+# locks, and ui_clk / ui_clk_sync_rst stay dead -- which is exactly what the
+# board reports (GPIO bit 1 = 0 with sys_rst provably released). If instead
+# C0_CLOCK_BOARD_INTERFACE wins and the real constraint is 4.000 ns, this
+# hypothesis is dead and the reference clock itself must be measured.
+foreach prop {C0.DDR4_TimePeriod C0.DDR4_InputClockPeriod C0_CLOCK_BOARD_INTERFACE} {
+    puts "PROBE: CLK CONFIG.$prop = [get_property -quiet CONFIG.$prop $ip]"
+    if {[catch {list_property_value CONFIG.$prop $ip} vals]} {
+        puts "PROBE: CLK CONFIG.$prop allowed = <none> ($vals)"
+    } else {
+        puts "PROBE: CLK CONFIG.$prop allowed = $vals"
+    }
+}
+
+# The timing constraint the IP generates for its own reference clock.
+foreach x [glob -nocomplain -directory [file join $work ip ddr4_c1] -types f */*.xdc *.xdc] {
+    set fh [open $x r]; set t [read $fh]; close $fh
+    foreach line [split $t "\n"] {
+        set line [string trim $line]
+        if {[string match create_clock* $line] || [string match *CLKIN1_PERIOD* $line]} {
+            puts "PROBE: CLK xdc [file tail $x] $line"
+        }
+    }
+}
+
+# MMCM/PLL parameters as written into the generated RTL (capped: the IP has
+# hundreds of files and only the clocking module matters).
+set shown 0
+foreach ext {v sv vhd} {
+    foreach f [glob -nocomplain -directory [file join $work ip ddr4_c1] -types f \
+                   *.$ext */*.$ext */*/*.$ext */*/*/*.$ext] {
+        if {$shown >= 60} { break }
+        set fh [open $f r]; set t [read $fh]; close $fh
+        foreach line [split $t "\n"] {
+            set line [string trim $line]
+            if {[regexp {CLKIN1_PERIOD|CLKFBOUT_MULT|DIVCLK_DIVIDE|CLKOUT0_DIVIDE} $line]} {
+                puts "PROBE: CLK rtl [file tail $f] $line"
+                if {[incr shown] >= 60} { puts "PROBE: CLK rtl (capped at 60 lines)"; break }
+            }
+        }
+    }
 }
 
 if {$do_synth} {
@@ -101,6 +151,21 @@ if {$do_synth} {
         }
     }
     puts "PROBE: LUT [llength [get_cells -hier -filter {PRIMITIVE_GROUP == CLB && PRIMITIVE_SUBGROUP == LUT}]]"
+
+    # The clocking primitive the controller actually got, after elaboration.
+    # CLKIN1_PERIOD here is the decisive number: 4.000 kills the hypothesis
+    # above, 14.161 confirms it.
+    foreach cell [get_cells -quiet -hier -filter {REF_NAME =~ MMCM* || REF_NAME =~ PLLE*}] {
+        puts "PROBE: CLK cell [get_property REF_NAME $cell] $cell"
+        foreach prop {CLKIN1_PERIOD CLKFBOUT_MULT_F CLKFBOUT_MULT DIVCLK_DIVIDE \
+                      CLKOUT0_DIVIDE_F CLKOUT0_DIVIDE} {
+            set v [get_property -quiet $prop $cell]
+            if {$v ne ""} { puts "PROBE: CLK   $prop = $v" }
+        }
+    }
+    foreach c [get_clocks -quiet] {
+        puts "PROBE: CLK clock $c period [get_property -quiet PERIOD $c] src [get_property -quiet SOURCE_PINS $c]"
+    }
 }
 # How the generated IP declares sys_rst. The DDR4 IP has no polarity
 # CONFIG property, so the polarity lives in the .xci interface metadata.
