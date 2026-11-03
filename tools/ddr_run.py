@@ -53,6 +53,7 @@ ITCM_END = 0x100000
 DTCM = (0x100000, 0x200000)
 DDR_BASE = 0x80000000
 MBX_GPIO = 24          # stub publishes GPIO DATA_IN here while waiting
+GPIO_UNSEEN = 0xA5A5A5A5   # seeded into MBX_GPIO; gpio_i is 8 bits, so never a real value
 RET_SENTINEL = 0x0BADD00D   # what the crt0 stores in _ret before main()
 
 # DTCM symbols worth reading back, in print order.
@@ -140,7 +141,9 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss):
     w("catch {riscv set_ebreakm off}")   # ebreak in the program traps, as on Nexus
     w("if {[catch {reset halt}]} { halt }")
     w("load_image %s 0x0 bin" % stub)
-    w("mww %d 0; mww %d 0; mww %d 0" % (MBX, MBX + 16, MBX + MBX_GPIO))
+    # Seed the GPIO slot with a value the stub can never store, so a 0x0 read
+    # back means GPIO really is 0 and not that the stub never got that far.
+    w("mww %d 0; mww %d 0; mww %d %d" % (MBX, MBX + 16, MBX + MBX_GPIO, GPIO_UNSEEN))
     w("echo \"DDRLOAD: stub loaded, waiting for DDR calibration\"")
     w("resume 0x0")
     w("set ok 0")
@@ -155,6 +158,17 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss):
     w("if {!$ok} {")
     w("  catch {halt}")
     w("  set g [mbx %d]" % MBX_GPIO)
+    # Where the stub is: wait_cal is the lw/sw/andi/beqz loop at 0x8..0x14.
+    # A pc parked on the lw at 0x8 every time (or a halt that fails) means
+    # the GPIO read itself never completes.
+    w("  for {set i 0} {$i < 3} {incr i} {")
+    w("    if {[catch {reg pc} p]} { set p \"unreadable: $p\" }")
+    w("    echo \"DDRLOAD: stub $p\"")
+    w("    catch {resume}; sleep 20; catch {halt}")
+    w("  }")
+    w("  if {$g == %d} {" % GPIO_UNSEEN)
+    w("    error \"DDRLOAD: the stub never stored GPIO DATA_IN (slot still %#010x): it is not running or its load from 0x40030000 never returns\"" % GPIO_UNSEEN)
+    w("  }")
     w("  echo [format \"DDRLOAD: GPIO DATA_IN = 0x%08x  calibrated=%d  ctrl-out-of-reset=%d  eos=%d  por-held=%d\" $g [expr {$g & 1}] [expr {($g >> 1) & 1}] [expr {($g >> 2) & 1}] [expr {($g >> 3) & 1}]]")
     # bits 2/3 exist only from patches/0012 on; on an older bitstream they read 0.
     w("  if {($g & 8) == 0 && ($g & 2) == 0} {")
