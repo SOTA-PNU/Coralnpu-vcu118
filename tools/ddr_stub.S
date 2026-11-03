@@ -2,7 +2,9 @@
 #
 # The debug module reaches only ITCM/DTCM, so the host writes a chunk into
 # ITCM and asks this loop (running from ITCM address 0) to copy it into DDR.
-# Mailbox at ITCM 0x100 (written by the host while the core is halted):
+# Mailbox at DTCM 0x1ff000 (written by the host while the core is halted).
+# Not ITCM: the core may load from ITCM, but a store there is an access
+# fault, which sends the stub back to 0 before it ever reaches the mailbox.
 #   +0  cmd    0 idle | 1 copy src->dst | 2 zero dst | 3 sum dst -> +20 | 4 jump dst
 #   +4  src    +8 dst   +12 len (bytes, multiple of 4)
 #   +16 state  0x0ddc0de1 once the DDR controller reports calibration done
@@ -20,7 +22,7 @@
         .text
         .globl _start
 _start:
-        li      s0, 0x100               # mailbox
+        li      s0, 0x1ff000            # mailbox (DTCM; a store to ITCM faults)
         li      s1, 0x40030000          # GPIO DATA_IN
 wait_cal:
         lw      t0, 0(s1)

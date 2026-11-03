@@ -33,7 +33,7 @@ import time
 
 # tools/ddr_stub.S assembled with llvm-mc (see the header of that file).
 STUB_WORDS = [
-    0x10000413, 0x400304b7, 0x0004a283, 0x00542c23, 0x0012f293,
+    0x001ff437, 0x400304b7, 0x0004a283, 0x00542c23, 0x0012f293,
     0xfe028ae3, 0x0ddc12b7, 0xde128293, 0x00542823, 0x00042283,
     0xfe028ee3, 0x00442503, 0x00842583, 0x00c42603, 0x00100313,
     0x02628063, 0x00200313, 0x02628c63, 0x00300313, 0x04628463,
@@ -45,7 +45,10 @@ STUB_WORDS = [
     0x0140006f, 0x00042023, 0x0ff0000f, 0x0000100f, 0x00058067,
     0x0ff0000f, 0x00042023, 0xf55ff06f,
 ]
-MBX = 0x100            # mailbox in ITCM
+# Mailbox in DTCM: a core store to ITCM is an access fault (Lsu.scala), so a
+# mailbox there traps on the stub's first sw. Top of DTCM, inside the ELF's
+# stack, which nothing touches until the stub jumps to the entry.
+MBX = 0x1FF000
 STATE_READY = 0x0DDC0DE1
 BUF = 0x1000           # staging buffer in ITCM
 BUF_MAX = 0x100000 - BUF
