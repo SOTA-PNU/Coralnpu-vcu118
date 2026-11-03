@@ -433,7 +433,8 @@ cmd_model() {
   if pgrep -x hw_server >/dev/null; then
     die "hw_server holds the JTAG cable. Close Vivado Hardware Manager or: pkill -u \$USER -x hw_server"
   fi
-  python3 "${ROOT}/tools/ddr_run.py" --cfg "$(openocd_cfg)" "${elf}" "$@"
+  # DDR segments go over the USB-UART (~90 KB/s); JTAG alone is ~1.3 KB/s.
+  python3 "${ROOT}/tools/ddr_run.py" --cfg "$(openocd_cfg)" --uart "$(find_uart)" "${elf}" "$@"
 }
 
 # ---------------------------------------------------------------------------

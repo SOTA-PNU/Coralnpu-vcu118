@@ -7,8 +7,10 @@ has no such link, and the RISC-V debug module only reaches ITCM/DTCM, so:
 
   1. reset-halt the core, put tools/ddr_stub.S at ITCM 0 and run it; it waits
      for the DDR controller's calibration (GPIO bit 0),
-  2. for each piece of a DDR segment: halt, write it into ITCM (0x1000..) with
-     the debugger, tell the stub to copy it to DDR, resume, wait,
+  2. with --uart: tell the stub to read each DDR segment from UART1 and stream
+     it over the USB-UART (~90 KB/s at 921600). Without it: for each piece,
+     halt, write it into ITCM (0x1000..) with the debugger, tell the stub to
+     copy it to DDR, resume, wait (~1.3 KB/s: one abstract command per word),
   3. ask the stub for a checksum of every DDR segment and compare,
   4. zero the TCM .bss, load the TCM segments with the debugger,
   5. tell the stub to jump to the ELF entry, then poll (halt, read, resume)
@@ -37,13 +39,16 @@ STUB_WORDS = [
     0xfe028ae3, 0x0ddc12b7, 0xde128293, 0x00542823, 0x00042283,
     0xfe028ee3, 0x00442503, 0x00842583, 0x00c42603, 0x00100313,
     0x02628063, 0x00200313, 0x02628c63, 0x00300313, 0x04628463,
-    0x00400313, 0x06628263, 0x0700006f, 0x06060663, 0x00052383,
+    0x00400313, 0x06628263, 0x07c0006f, 0x06060663, 0x00052383,
     0x0075a023, 0x00450513, 0x00458593, 0xffc60613, 0xfe0616e3,
     0x0500006f, 0x04060663, 0x0005a023, 0x00458593, 0xffc60613,
     0xfe061ae3, 0x0380006f, 0x00000e13, 0x00060c63, 0x0005a383,
     0x007e0e33, 0x00458593, 0xffc60613, 0xfe0618e3, 0x01c42a23,
     0x0140006f, 0x00042023, 0x0ff0000f, 0x0000100f, 0x00058067,
-    0x0ff0000f, 0x00042023, 0xf55ff06f,
+    0x0ff0000f, 0x00042023, 0xf55ff06f, 0x00500313, 0xfe6298e3,
+    0x400103b7, 0x01c42e03, 0x000e0463, 0x01c3a823, 0xfc060ee3,
+    0x0143ae03, 0x020e7e13, 0xfe0e1ce3, 0x0183ae03, 0x01c58023,
+    0x00158593, 0xfff60613, 0xfe0612e3, 0xfb9ff06f,
 ]
 # Mailbox in DTCM: a core store to ITCM is an access fault (Lsu.scala), so a
 # mailbox there traps on the stub's first sw. Top of DTCM, inside the ELF's
@@ -57,7 +62,9 @@ DTCM = (0x100000, 0x200000)
 DDR_BASE = 0x80000000
 MBX_GPIO = 24          # stub publishes GPIO DATA_IN here while waiting
 GPIO_UNSEEN = 0xA5A5A5A5   # seeded into MBX_GPIO; gpio_i is 8 bits, so never a real value
+MBX_UART_CTRL = 28     # UART1 CTRL value the stub writes before cmd 5
 RET_SENTINEL = 0x0BADD00D   # what the crt0 stores in _ret before main()
+CLK_HZ = 50000000      # SoC main clock; the UART NCO is derived from it
 
 # DTCM symbols worth reading back, in print order.
 RESULT_SYMS = [
@@ -107,7 +114,9 @@ def wsum(b):
 
 
 # --------------------------------------------------------------------------
-def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss):
+def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss, uart_ctrl=None):
+    """uart_ctrl: UART1 CTRL word to stream DDR segments over the USB-UART
+    instead of JTAG; the payloads to send are returned in `uart`."""
     entry, segs, syms = read_elf(elf)
     ddr = [s for s in segs if s["addr"] >= DDR_BASE]
     tcm = [s for s in segs if s["addr"] < DDR_BASE]
@@ -139,6 +148,21 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss):
     w("proc stub_cmd {cmd src dst len what} {")
     w("  mww %d $src; mww %d $dst; mww %d $len; mww %d $cmd" % (MBX + 4, MBX + 8, MBX + 12, MBX))
     w("  wait_stub $what 3000")
+    w("}")
+    # cmd 5: the stub reads $len bytes from UART1 into $dst. The host sends
+    # them once it sees "UART GO" and creates $flag when the last byte is out.
+    # The core must not be halted meanwhile: the RX FIFO holds only a few
+    # dozen bytes, a few ms of line time.
+    w("proc uart_rx {dst len idx flag limit} {")
+    w("  mww %d $dst; mww %d $len; mww %d 5" % (MBX + 8, MBX + 12, MBX))
+    w("  resume")
+    w("  echo \"DDRLOAD: UART GO $idx\"")
+    w("  for {set i 0} {![file exists $flag]} {incr i} {")
+    w("    if {$i > $limit} { error \"DDRLOAD: host never finished sending segment $idx\" }")
+    w("    sleep 50")
+    w("  }")
+    w("  sleep 200; halt")
+    w("  if {[mbx 0] != 0} { wait_stub {uart receive} 250 }")
     w("}")
     w("init")
     w("catch {riscv set_ebreakm off}")   # ebreak in the program traps, as on Nexus
@@ -184,9 +208,21 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss):
     total = sum(len(s["data"]) for s in ddr)
     done = 0
     n = 0
+    uart = []
+    if uart_ctrl is not None:
+        w("mww %d %d" % (MBX + MBX_UART_CTRL, uart_ctrl))
     for s in ddr:
         data = s["data"] + b"\0" * (-len(s["data"]) % 4)
-        for off in range(0, len(data), chunk):
+        if uart_ctrl is not None:
+            flag = os.path.join(tmp, "uart%d.sent" % len(uart))
+            # 50 ms polls: three times the line time at 9600 baud, plus a minute.
+            limit = (len(data) * 10 * 3 // 9600 + 60) * 20
+            w("uart_rx %#x %#x %d %s %d" % (s["addr"], len(data), len(uart), flag, limit))
+            uart.append((data, flag))
+            n += 1
+            done += len(data)
+            w("echo \"DDRLOAD: %d / %d KB\"" % (done // 1024, total // 1024))
+        for off in range(0, len(data) if uart_ctrl is None else 0, chunk):
             piece = data[off:off + chunk]
             p = os.path.join(tmp, "ddr%04d.bin" % n)
             with open(p, "wb") as f:
@@ -253,7 +289,7 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss):
     script = os.path.join(tmp, "ddr_run.tcl")
     with open(script, "w") as f:
         f.write("\n".join(L) + "\n")
-    return script, entry, segs, syms, total, n
+    return script, entry, segs, syms, total, n, uart
 
 
 def words_to_text(ws):
@@ -263,6 +299,40 @@ def words_to_text(ws):
 
 def f32(h):
     return struct.unpack("<f", struct.pack("<I", int(h, 16)))[0]
+
+
+def uart_ctrl_word(baud):
+    """UART1 CTRL: NCO in [31:16], RX and TX enable (as fpga/sw/uart.c)."""
+    nco = (baud << 20) // CLK_HZ
+    if not 0 < nco < 1 << 16:
+        sys.exit("baud %d is out of the UART NCO range at %d Hz" % (baud, CLK_HZ))
+    return (nco << 16) | 3
+
+
+def open_uart(dev, baud):
+    import termios
+    speed = getattr(termios, "B%d" % baud, None)
+    if speed is None:
+        sys.exit("this host has no termios.B%d" % baud)
+    fd = os.open(dev, os.O_RDWR | os.O_NOCTTY)
+    attr = termios.tcgetattr(fd)
+    attr[0] = 0                                                    # iflag
+    attr[1] = 0                                                    # oflag
+    attr[2] = termios.CS8 | termios.CREAD | termios.CLOCAL         # cflag: 8N1, no flow control
+    attr[3] = 0                                                    # lflag
+    attr[4] = attr[5] = speed
+    termios.tcsetattr(fd, termios.TCSANOW, attr)
+    termios.tcflush(fd, termios.TCIOFLUSH)
+    return fd
+
+
+def uart_send(fd, data):
+    import termios
+    view = memoryview(data)
+    while view:
+        k = os.write(fd, view[:65536])
+        view = view[k:]
+    termios.tcdrain(fd)
 
 
 def main():
@@ -276,22 +346,33 @@ def main():
     ap.add_argument("--poll", type=float, default=2.0, help="poll period while running, s")
     ap.add_argument("--zero-ddr-bss", action="store_true",
                     help="also zero DDR memsz beyond filesz (heap; ~112 MB, slow)")
+    ap.add_argument("--uart", default="",
+                    help="USB-UART tty: send the DDR segments over it instead of JTAG")
+    ap.add_argument("--baud", type=int, default=921600)
+    ap.add_argument("--jtag", action="store_true", help="load over JTAG even if --uart is given")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--keep", action="store_true", help="keep the temp directory")
     a = ap.parse_args()
     if not 4 <= a.chunk <= BUF_MAX or a.chunk % 4:
         sys.exit("--chunk must be a multiple of 4 up to %#x" % BUF_MAX)
 
+    use_uart = bool(a.uart) and not a.jtag
+    if use_uart and not os.path.exists(a.uart):
+        print("==> no UART at %r; loading over JTAG" % a.uart)
+        use_uart = False
     tmp = tempfile.mkdtemp(prefix="ddr_run_")
-    script, entry, segs, syms, total, n = build_script(
-        a.elf, tmp, a.chunk, a.timeout, a.poll, a.zero_ddr_bss)
-    print("==> %s: entry %#x, %d KB to DDR in %d pieces" % (a.elf, entry, total // 1024, n))
+    script, entry, segs, syms, total, n, uart = build_script(
+        a.elf, tmp, a.chunk, a.timeout, a.poll, a.zero_ddr_bss,
+        uart_ctrl_word(a.baud) if use_uart else None)
+    print("==> %s: entry %#x, %d KB to DDR in %d pieces over %s" % (
+        a.elf, entry, total // 1024, n, "%s @ %d" % (a.uart, a.baud) if use_uart else "JTAG"))
     for s in segs:
         print("    seg %#010x filesz %#x memsz %#x" % (s["addr"], s["filesz"], s["memsz"]))
     if a.dry_run:
         print("==> dry run; OpenOCD script:", script)
         return
 
+    fd = open_uart(a.uart, a.baud) if use_uart else None
     t0 = time.time()
     proc = subprocess.Popen(["openocd", "-f", a.cfg, "-f", script],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -301,10 +382,21 @@ def main():
         log.append(line)
         if line.startswith("DDRLOAD:"):
             print("    %6.1fs %s" % (time.time() - t0, line.rstrip()), flush=True)
+            m = re.match(r"DDRLOAD: UART GO (\d+)", line)
+            if m and fd is not None:
+                data, flag = uart[int(m.group(1))]
+                ts = time.time()
+                uart_send(fd, data)
+                dt = time.time() - ts
+                print("    %6.1fs UART sent %d KB in %.1f s (%.1f KB/s)" % (
+                    time.time() - t0, len(data) // 1024, dt, len(data) / 1024 / max(dt, 1e-3)), flush=True)
+                open(flag, "w").close()
         elif line.startswith("RES "):
             parts = line.split()
             res[parts[1]] = parts[2:]
     rc = proc.wait()
+    if fd is not None:
+        os.close(fd)
     logf = os.path.join(tmp, "openocd.log")
     with open(logf, "w") as f:
         f.writelines(log)
