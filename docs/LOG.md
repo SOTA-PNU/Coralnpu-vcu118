@@ -192,6 +192,46 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 - `coral program` 이 cs_server 도 종료 (남은 cs_server 가 CPU 100% 를 계속 쓰던 문제)
 - VM 보안 점검: SSH 로그인은 모두 10.0.2.2(호스트 PC), crontab·authorized_keys 없음. 채굴 침해는 다른 Linux 기기(actions-runner) 쪽으로 보임
 
+## [10/31] 0011 진단 판 결과: 컨트롤러가 리셋에서 안 나옴
+
+- 빌드 약 7시간 47분, 타이밍 통과. RVV, matmul 은 그대로 PASS
+- lenet5: 보정 시간 초과. GPIO 입력 = 0x0 → 비트 1(리셋 해제) = 0, 컨트롤러가 리셋 상태로 멈춰 있음
+- 로더 보강 (재빌드 없음)
+  - 디버그 모듈은 TCM 만 접근 가능해 호스트에서 GPIO(0x4003_0000)를 직접 못 읽음
+  - 스텁이 GPIO 값을 메일박스 +24 에 기록 → 호스트가 시간 초과 시 비트별로 출력
+- 리셋 극성 확인 (`coral ddr4-probe`)
+  - IP 에는 극성 CONFIG 가 없고 `.xci` 인터페이스 메타데이터에만 있음: `SYSTEM_RESET` = ACTIVE_HIGH → RTL 과 일치
+  - 핀 확인(synth 모드, 이제 기본): 118 포트 전부 배치, `c0_sys_clk_p → E12 DIFF_SSTL12`
+- 실수: 진단 로그를 넣으려고 이미 적용된 `patches/0009` 를 고침 → `coral` 이 "changed since it was applied" 로 모든 빌드 중단. 11/02 되돌림
+  - 규칙: 적용된 패치 파일은 고치지 않는다. 빌드 변경은 새 번호 패치로, probe 용은 루트의 `vivado/*.tcl` 로
+
+## [11/02] 0012 판: 파워온 리셋 카운터 — 여전히 리셋 상태
+
+- `patches/0012`: 컨트롤러 sys_rst 를 STARTUPE3 EOS 대신 메인 클럭 카운터로 구동. GPIO 비트 2 = EOS, 비트 3 = 파워온 리셋
+- 빌드 08:56 → 18:08 (**9시간 10분**), clk_main WNS +0.170, LUT 539,385 (45.62%)
+- RVV, matmul PASS (int8 128³ 17.45x, f32 64³ 17.93x)
+- lenet5: GPIO 입력 = 0x0 (calibrated / out-of-reset / eos / por-held 전부 0)
+  - 파워온 리셋은 해제됐는데 컨트롤러는 리셋 → 250 MHz 기준 클럭 쪽이 남은 용의자
+  - 단, 0011·0012 두 판에서 이 GPIO 워드의 비트가 1 로 읽힌 적이 한 번도 없음 → "GPIO 읽기 경로 고장" 하나로도 설명 가능. 다음 RTL 변경 때 상수 1 비트를 넣어 자가 검증할 것
+- probe 에 클럭 덤프 추가: 생성된 IP 의 MMCM 이 `CLKIN1_PERIOD 14.161`, `CLKFBOUT_MULT_F 17`, xdc `create_clock -period 14.161`
+  - 보드 250 MHz 를 넣으면 VCO = 4250 MHz → MMCME4 상한(약 1600 MHz) 초과 → 락 실패 → ui_clk 없음 → 보정 시작 안 됨
+
+## [11/03] DDR4 원인 확정과 수정 (`patches/0013`)
+
+- 원인: `vcu118_ddr4_c1_ip.tcl` 의 `CONFIG.C0.DDR4_TimePeriod 1000` 요청
+  - 보드 프리셋이 C1 을 DDR4-2400(833 ps)으로 고정해 이 요청을 거부함. 무해한 no-op 으로 봤지만 아니었음
+  - 요청 시 IP 가 입력 클럭 주기를 1000 ps 기준으로 다시 계산 → TimePeriod 만 833 으로 돌아가고 입력 주기는 17 × 833 = 14161 ps(70.6 MHz)로 남음
+- IP 네 개를 한 단계씩 바꿔 비교 (InputClockPeriod)
+  - a 현행 14161 / b 요청 삭제 **4000** / c 현행 + 4000 강제 14161 / d 삭제 + 4000 강제 **4000**
+  - → 삭제만으로 충분. 4000/833 = 4.8 이라 강제로는 못 고침
+- 잃는 것 없음: 1000 ps 는 어떤 빌드에서도 적용된 적 없음. SoC 쪽 CDC 는 `ddr4_c1_axi_up` 비동기 FIFO 가 처리
+- `patches/0013` + `vivado/ddr4_c1_ip.tcl` 같은 수정
+- 빌드 전 검증 probe 통과
+  - `InputClockPeriod 4000`, xdc `create_clock -period 4.0`
+  - MMCM `CLKIN1_PERIOD 4.000`, `CLKFBOUT_MULT_F 6`, `CLKOUT0_DIVIDE_F 5` → VCO 1500 MHz, ui_clk 300 MHz (3.333 ns), PHY PLL ×4 = 1200 MHz (tCK 833 ps)
+- 17:35 vector_highmem 빌드 시작 (0013 적용, 끝나면 모델 4개 자동 실행)
+- 미측정: E12 에 250 MHz 가 실제로 들어오는지 (빌드 결과의 LED 5 / GPIO 비트 1 로 확인)
+
 ## [진행 예정]
 
 - (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음
@@ -199,6 +239,8 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 - (급하지 않음) 보드를 학교 Linux 서버 PC 로 이전: `tools/setup-board-host.sh` → 보드 USB·전원 이동 → VM 에서 .bit / openocd cfg / ~/models 복사 → `coral program`, `coral model`
 - 보드에 올린 ELF 에 벡터 명령이 실제로 들어 있는지 objdump 로 확인
 - 행렬곱 커널 최적화 (레지스터 블로킹), 신경망 레이어 단위 측정
-- JTAG 적재 속도 개선
-- DDR4 MIG 연결 (patches/0009, 10/26 진행 중)
+- JTAG 적재 속도: lenet5(821 KB) 적재 시간을 재서 vgg(15.9 MB) 추정 (progbufsize=0 → 워드마다 abstract command)
+- 0013 판 결과 확인: GPIO 비트 0/1, 모델 4개 실행, 힙 실사용량
+- DDR4 가 끝내 안 되면: 0x8000_0000 에 DDR4 대신 온칩 BRAM/URAM (ELF 무수정, 약 36 MB 여유)
+- `overnight.sh` 가 빌드 단계(synth/P&R/비트스트림)를 summary 에 기록
 - 상류 결함 보고: autoboot 리셋 net 선언 순서 (Nexus ROM 빌드도 같은 문제로 추정)
