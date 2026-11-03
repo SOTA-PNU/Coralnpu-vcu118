@@ -95,9 +95,27 @@ proc vcu118_ddr4_c1 {ipdir} {
     vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_AxiDataWidth 256
     vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_AxiIDWidth 4
     vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_AxiNarrowBurst true
-    # The preset runs C1 at DDR4-2400 (ui_clk 300 MHz). 1000 ps (ui_clk
-    # 250 MHz) would give the SoC's DDR-side CDC more margin.
-    vcu118_ddr4_c1_try $ip CONFIG.C0.DDR4_TimePeriod 1000
+    # Do NOT ask for DDR4_TimePeriod here. The board preset pins C1 at
+    # DDR4-2400 (833 ps, ui_clk 300 MHz) and refuses 1000 ps -- but the
+    # refused request is not a no-op. It makes the IP recompute the input
+    # clock period for 1000 ps, and when TimePeriod snaps back to 833 the
+    # input period is left snapped to 17 x 833 = 14161 ps (70.6 MHz) while
+    # the board drives c0_sys_clk at 250 MHz (4000 ps). The controller MMCM
+    # is then built with CLKIN1_PERIOD 14.161 and CLKFBOUT_MULT_F 17, so on
+    # the real 250 MHz pin its VCO would have to run at 4250 MHz, far above
+    # the MMCME4 limit. It never locks, ui_clk never starts, ui_clk_sync_rst
+    # stays asserted and calibration never begins -- exactly what the board
+    # reported on the 0011 and 0012 builds.
+    #
+    # Measured with four one-step-apart IPs (coral ddr4-probe, 11/03):
+    #   with this request          -> InputClockPeriod 14161
+    #   without it                 -> InputClockPeriod 4000
+    #   with it, then forcing 4000 -> still 14161 (4000/833 = 4.8 is illegal)
+    # Dropping the request is the whole fix; nothing needs to force 4000.
+    #
+    # Cost: none. 1000 ps never took effect, and the reason it was wanted --
+    # CDC margin on the SoC DDR side -- is already handled by the async FIFO
+    # in ddr4_c1_axi_up (ACLK_ASYNC 1).
 
     foreach p {C0_DDR4_BOARD_INTERFACE C0_CLOCK_BOARD_INTERFACE C0.DDR4_MemoryPart
                C0.DDR4_MemoryType C0.DDR4_DataWidth C0.DDR4_Ecc C0.DDR4_TimePeriod
