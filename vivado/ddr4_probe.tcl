@@ -22,6 +22,60 @@ puts "PROBE: board parts (default paths): [get_board_parts -quiet *vcu118*]"
 
 set ips [vcu118_ddr4_c1_all [file join $work ip]]
 set ip [lindex $ips 0]
+# --- which setting makes InputClockPeriod come out 4000? ---------------------
+# Measured: the shipped settings give InputClockPeriod 14161 = 17 x 833, and the
+# MMCM is built for 70.6 MHz while the board pin carries 250 MHz. 4000/833 = 4.8
+# is not an integer, so 4000 may simply be illegal once TimePeriod snaps to 833 --
+# while 4000 = 4 x 1000 is legal at the 1000 ps the script asks for and is refused.
+# Build throwaway IPs with single changes and print what each one settles on.
+# They are removed again so they never reach synthesis.
+proc clk_variant {tag ipdir ddr_if clk_if steps} {
+    set name ddr4_probe_$tag
+    if {[catch {
+        create_ip -name ddr4 -vendor xilinx.com -library ip -module_name $name -dir $ipdir
+        set v [get_ips $name]
+        set_property CONFIG.C0_DDR4_BOARD_INTERFACE $ddr_if $v
+        if {$clk_if ne ""} { catch {set_property CONFIG.C0_CLOCK_BOARD_INTERFACE $clk_if $v} }
+        foreach {prop val} $steps {
+            if {[catch {set_property CONFIG.$prop $val $v} e]} {
+                puts "PROBE: CLK variant $tag could not set $prop=$val"
+            }
+        }
+        puts [format "PROBE: CLK variant %-10s TimePeriod=%-6s InputClockPeriod=%-7s DataWidth=%-3s AxiDataWidth=%s" \
+            $tag [get_property -quiet CONFIG.C0.DDR4_TimePeriod $v] \
+                 [get_property -quiet CONFIG.C0.DDR4_InputClockPeriod $v] \
+                 [get_property -quiet CONFIG.C0.DDR4_DataWidth $v] \
+                 [get_property -quiet CONFIG.C0.DDR4_AxiDataWidth $v]]
+    } err]} {
+        puts "PROBE: CLK variant $tag FAILED: $err"
+    }
+    catch {remove_files [get_files -quiet ${name}.xci]}
+    catch {file delete -force [file join $ipdir $name]}
+}
+
+set _ddr_if ""; set _clk_if ""
+foreach i [get_board_part_interfaces -quiet *] {
+    if {$_ddr_if eq "" && [string match -nocase *ddr4*c1* $i]} { set _ddr_if $i }
+    if {$_clk_if eq "" && [string match -nocase *250mhz_clk1* $i]} { set _clk_if $i }
+}
+# Everything vcu118_ddr4_c1 sets, in order, except the last line.
+set _common {C0.DDR4_AxiSelection true C0.DDR4_Ecc false C0.DDR4_DataWidth 32
+             C0.DDR4_AxiDataWidth 256 C0.DDR4_AxiIDWidth 4 C0.DDR4_AxiNarrowBurst true}
+if {$_ddr_if ne ""} {
+    set vdir [file join $work ipvar]
+    file mkdir $vdir
+    #   a = exactly what the build does now (expect 14161)
+    clk_variant a $vdir $_ddr_if $_clk_if [concat $_common {C0.DDR4_TimePeriod 1000}]
+    #   b = same, minus the TimePeriod request that is refused anyway
+    clk_variant b $vdir $_ddr_if $_clk_if $_common
+    #   c = as now, then ask for 4000 explicitly, last
+    clk_variant c $vdir $_ddr_if $_clk_if [concat $_common {C0.DDR4_TimePeriod 1000 C0.DDR4_InputClockPeriod 4000}]
+    #   d = no TimePeriod request, then ask for 4000 explicitly
+    clk_variant d $vdir $_ddr_if $_clk_if [concat $_common {C0.DDR4_InputClockPeriod 4000}]
+} else {
+    puts "PROBE: CLK variant skipped (no DDR4 C1 board interface)"
+}
+
 generate_target {instantiation_template synthesis} $ips
 
 proc ports_of {work name} {
