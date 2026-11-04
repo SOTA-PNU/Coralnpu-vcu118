@@ -38,6 +38,9 @@ work/ out/ .tools/  (git 제외) 상류 체크아웃 / 산출물 / 내려받은 
 
 내 프로그램을 돌릴 때는 `./coral load my_program.elf`, 콘솔만 볼 때는 `./coral console`.
 
+DDR 에 올리는 IREE 모델 ELF 는 `./coral model <elf>` (vector_highmem 비트스트림).
+어떤 ELF 가 돌아가는지(명령어 셋, 메모리 배치, 결과 심볼)는 [docs/MODEL_ELF.md](docs/MODEL_ELF.md).
+
 ## 처음 한 번
 
 **현재 구성 (2026-10-13): 빌드는 VM, 실행은 fractal.**
@@ -130,8 +133,8 @@ BSCANE2 디버그 전송, 핀 XDC(AMD 보드 파일과 대조 완료), Vivado �
 
 ## 알려진 한계
 
-- **DDR4 미연결.** `0x8000_0000` 이상 접근 시 버스가 멈춘다 → CPU_RESET 버튼.
-- 보드 검증 완료 (vector_normal, 50 MHz): 부팅, JTAG 적재, UART, RVV, 행렬곱.
+- **DDR4 는 vector_highmem 판에만 있다** (`patches/0009`~`0013`). vector_normal 판에서 `0x8000_0000` 이상 접근 시 버스가 멈춘다 → CPU_RESET 버튼.
+- 보드 검증 완료 (50 MHz): 부팅, JTAG 적재, UART, RVV, 행렬곱, DDR4 보정, IREE 모델 4개 실행.
 - **matrix_* 판은 VU9P 에 들어가지 않는다.** LUT 87%, CLB 99% 로 배선에 실패한다. 상류는 VU13P 를 쓴다. 자세한 내용은 docs/LOG.md [10/21].
 - OpenOCD 의 IR 코드는 Vivado 의 BSDL 에서 읽는다(`gen_openocd_cfg.sh`). 첫 실행 때
   `out/openocd_vcu118.cfg` 의 값을 확인해 둘 것.
