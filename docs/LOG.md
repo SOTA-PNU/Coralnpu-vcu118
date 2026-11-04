@@ -257,6 +257,28 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 - 정답 여부는 미판정 (기준값 없음). `cyc_*` 는 32비트라 86 초마다 넘침 — 긴 실행은 벽시계 기준
 - OpenOCD 0.11 이 생성 설정의 `riscv set_mem_access abstract` 를 모름 (오류 출력, 동작엔 무관)
 
+## [11/04 오후] 보드가 직접 UART 로 결과 출력, 보드를 연구실 서버로
+
+- 보드 직접 출력 (`tools/result_printer.S`, 모델 ELF 재빌드 없음)
+  - 4개 모델 crt0 끝이 같음: `sw a0,_ret ; beqz ; ebreak ; … ; mpause ; j .` → 로더가 DDR 이미지에서 beqz/ebreak 두 워드를 `lui t0,0 ; jalr x0,0x400(t0)` 로 바꿔 ITCM 0x400 출력 루틴으로 보냄
+  - 출력 루틴: ITCM 0x800 표(호스트가 만듦)를 따라 결과 심볼을 hex 로 찍고 줄 끝에 `=합`, 끝나면 완료 플래그 + mpause
+  - 호스트: tty 수신 스레드, 줄 합 검증, 디버거로 읽은 값과 대조
+  - 어셈블러가 없는 호스트라 `tools/rvasm.pl` (RV32I 소형 어셈블러). `--check` 로 스텁 69 + 출력 루틴 96 워드가 소스와 일치함을 확인
+- VM(VirtualBox USB 패스스루)에서 yolo 출력 텐서(862 KB → 텍스트 2 MB)가 2.8 % 유실 → 흐름 제어(256 바이트마다 ACK)와 줄 체크섬 추가. 첫 ACK 계산은 유실 후 한 블록씩 밀려 0.2 s/블록으로 멈춤 → 블록 경계 재동기화로 수정
+- 보드를 연구실 서버 sota-AIP (192.168.1.150, Ubuntu 24.04, 24코어, 62 GB) 로 이전
+  - Vivado Lab 2026.1 (SFD), OpenOCD 0.12, 케이블 드라이버, en_US.UTF-8 로캘. 설치 스크립트 수정 3건(d303246)
+  - 이 PC 의 VM 은 빌드 전용으로 남음 (새 PC 로 이전 예정)
+- 서버 실측 (UART 921600, 흐름 제어)
+
+| 항목 | 결과 |
+|---|---|
+| lenet5 / charrnn / vgg | argmax 7 / 53 / 92, 줄 합 17/17, 디버거 대조 17/17. 15.7 s / 34.4 s / 309.8 s |
+| yolo | argmax 959, **출력 텐서 215,475 워드 전부, 깨진 토큰 0, 재동기화 0**, 출력 23 s, 전체 918.6 s |
+| RVV / matmul | PASS, 사이클 이전과 동일 (int8 128³ 17.45x, f32 64³ 17.93x) |
+
+- 유실 원인은 VirtualBox USB 경로로 추정 (서버 직결에서는 0). 측정으로 분리하지는 않음
+- CI: `.github/workflows/board-test.yml` (self-hosted `vcu118` 러너, 서버 `~/actions-runner-vcu118`)
+
 ## [진행 예정]
 
 - (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음
