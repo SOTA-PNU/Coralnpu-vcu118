@@ -450,18 +450,25 @@ class UartReader(threading.Thread):
 
     Once `acking` is set (after the DDR load, so no ack can land in the data
     the stub is receiving), it acks every PRINT_ACK_BLOCK bytes counted from
-    @@BEGIN, as the printer expects. If bytes were lost the count lags and the
-    board would wait for an ack that never comes, so an idle 0.2 s while the
-    board is mid-output also sends one."""
+    @@BEGIN, as the printer expects. If bytes were lost, the count stops short
+    of the block the board just finished and the board waits for an ack that
+    never comes. An idle 0.2 s mid-output therefore means "the board is
+    waiting": ack once and pad the count up to that block boundary, so the
+    count lines up with the board again. (The first version just acked once
+    more and kept the short count; it then lagged by a block for good and
+    the board ran at one block per 0.2 s timeout: 337 KB in 244 s, 11/04.)"""
 
     def __init__(self, fd):
         super().__init__(daemon=True)
         self.fd, self.buf, self.stop = fd, bytearray(), threading.Event()
-        self.acking, self.begin, self.acks = False, None, 0
+        self.acking, self.begin, self.acks, self.pad, self.resyncs = False, None, 0, 0, 0
 
     def ack(self, n):
         os.write(self.fd, b"\x06" * n)
         self.acks += n
+
+    def counted(self):
+        return len(self.buf) - self.begin + self.pad
 
     def run(self):
         while not self.stop.is_set():
@@ -473,11 +480,21 @@ class UartReader(threading.Thread):
                     k = self.buf.find(b"@@BEGIN")
                     self.begin = k if k >= 0 else None
                 if self.begin is not None:
-                    due = (len(self.buf) - self.begin) // PRINT_ACK_BLOCK - self.acks
+                    due = self.counted() // PRINT_ACK_BLOCK - self.acks
                     if due > 0:
                         self.ack(due)
             elif self.acking and self.begin is not None and b"@@END" not in self.buf:
-                self.ack(1)
+                short = -self.counted() % PRINT_ACK_BLOCK
+                if short:
+                    self.pad += short
+                    self.resyncs += 1
+                due = self.counted() // PRINT_ACK_BLOCK - self.acks
+                if due > 0:
+                    self.ack(due)
+                else:
+                    # in step, so the ack itself went missing: resend it
+                    # without counting it, or the count would run ahead
+                    os.write(self.fd, b"\x06")
 
 
 def board_results(raw):
@@ -606,9 +623,9 @@ def main():
                                   ln[:160] + " ... (%d words)" % (len(ln.split()) - 2)))
             sums = [name for name, (_, ok) in board.items() if ok is not None]
             bad = [name for name in sums if not board[name][1]]
-            print("==> board line sums: %s (%d acks sent)" % (
+            print("==> board line sums: %s (%d acks sent, %d resyncs = blocks with lost bytes)" % (
                 "%d/%d ok" % (len(sums), len(sums)) if not bad else "BAD in " + ", ".join(bad),
-                reader.acks))
+                reader.acks, reader.resyncs))
     if fd is not None:
         os.close(fd)
     logf = os.path.join(tmp, "openocd.log")
