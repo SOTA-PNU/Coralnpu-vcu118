@@ -15,6 +15,7 @@
 #       tell the three bring-up cases apart (the debug module cannot read
 #       0x40030000 itself): bit 0 calibrated, bit 1 controller out of reset
 #   +28 UART1 CTRL (NCO << 16 | RX/TX enable) written before cmd 5; 0 = keep
+#   +32 0x0d0e0d0e once tools/result_printer.S has printed the results
 # The stub clears cmd when a command is finished.
 # GPIO DATA_IN (0x40030000) bit 0 = DDR init_calib_complete (chip_vcu118).
 #

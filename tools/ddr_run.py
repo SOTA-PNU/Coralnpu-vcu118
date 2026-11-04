@@ -27,13 +27,15 @@ Only the Python standard library is used.
 import argparse
 import os
 import re
+import select
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
-# tools/ddr_stub.S assembled with llvm-mc (see the header of that file).
+# tools/ddr_stub.S assembled (`perl tools/rvasm.pl --check` compares the two).
 STUB_WORDS = [
     0x001ff437, 0x400304b7, 0x0004a283, 0x00542c23, 0x0012f293,
     0xfe028ae3, 0x0ddc12b7, 0xde128293, 0x00542823, 0x00042283,
@@ -50,6 +52,33 @@ STUB_WORDS = [
     0x0143ae03, 0x020e7e13, 0xfe0e1ce3, 0x0183ae03, 0x01c58023,
     0x00158593, 0xfff60613, 0xfe0612e3, 0xfb9ff06f,
 ]
+# tools/result_printer.S assembled at PRINTER (rvasm.pl --check covers it too).
+PRINTER = 0x400
+PRINTER_WORDS = [
+    0x400103b7, 0x000004b7, 0x50848493, 0x00001437, 0x80040413,
+    0x00042e03, 0x000e0463, 0x01c3a823, 0x00840413, 0x00042683,
+    0x08068e63, 0x00442703, 0x00842783, 0x00c40413, 0x0006c503,
+    0x00050863, 0x0b4000ef, 0x00168693, 0xff1ff06f, 0x0407c063,
+    0x06078463, 0x02000513, 0x09c000ef, 0x00072803, 0x00800893,
+    0x01c85513, 0x00950533, 0x00054503, 0x084000ef, 0x00481813,
+    0xfff88893, 0xfe0894e3, 0x00470713, 0xfff78793, 0xfc9ff06f,
+    0x00179793, 0x0017d793, 0x02000513, 0x05c000ef, 0x00078e63,
+    0x00074503, 0x00050a63, 0x04c000ef, 0x00170713, 0xfff78793,
+    0xfe9ff06f, 0x00a00513, 0x038000ef, 0xf65ff06f, 0x0143af03,
+    0x008f7f13, 0xfe0f0ce3, 0x00001eb7, 0x800e8e93, 0x004eae83,
+    0x0d0e1e37, 0xd0ee0e13, 0x01cea023, 0x0ff0000f, 0x08000073,
+    0x0000006f, 0x0143af03, 0x001f7f13, 0xfe0f1ce3, 0x00a3ae23,
+    0x00008067, 0x33323130, 0x37363534, 0x62613938, 0x66656463,
+    0x00000000,
+]
+PRINT_TABLE = 0x800    # host-built table the printer walks (see result_printer.S)
+PRINT_DONE = 0x0D0E0D0E
+# crt0 tail of the IREE model ELFs, from the beqz after "sw a0, _ret":
+#   beqz a0 ; ebreak ; j +16 ; csrr a0, minstret ; csrr a1, minstreth ; mpause
+CRT0_TAIL = struct.pack("<6I", 0x00050663, 0x00100073, 0x0100006f,
+                        0xb0202573, 0xb82025f3, 0x08000073)
+# what replaces beqz/ebreak: lui t0, 0 ; jalr x0, PRINTER(t0)
+CRT0_TO_PRINTER = struct.pack("<2I", 0x000002b7, (PRINTER << 20) | (5 << 15) | 0x67)
 # Mailbox in DTCM: a core store to ITCM is an access fault (Lsu.scala), so a
 # mailbox there traps on the stub's first sw. Top of DTCM, inside the ELF's
 # stack, which nothing touches until the stub jumps to the entry.
@@ -63,6 +92,7 @@ DDR_BASE = 0x80000000
 MBX_GPIO = 24          # stub publishes GPIO DATA_IN here while waiting
 GPIO_UNSEEN = 0xA5A5A5A5   # seeded into MBX_GPIO; gpio_i is 8 bits, so never a real value
 MBX_UART_CTRL = 28     # UART1 CTRL value the stub writes before cmd 5
+MBX_PRINT_DONE = 32    # the result printer stores PRINT_DONE here when finished
 RET_SENTINEL = 0x0BADD00D   # what the crt0 stores in _ret before main()
 CLK_HZ = 50000000      # SoC main clock; the UART NCO is derived from it
 
@@ -113,11 +143,53 @@ def wsum(b):
     return sum(struct.unpack("<%dI" % (len(b) // 4), b)) & 0xFFFFFFFF
 
 
+def print_table(syms, label, ctrl):
+    """ITCM image for PRINT_TABLE: header, {name, addr, n} entries, labels.
+    Returns (bytes, characters the board will print)."""
+    ents = [("@@BEGIN " + label, 0, 0)]
+    for name in RESULT_SYMS + ARRAY_SYMS:
+        if name in syms:
+            addr, size = syms[name]
+            ents.append((name, addr, max(1, size // 4)))
+    for name in TEXT_SYMS:
+        if name in syms:
+            addr, size = syms[name]
+            ents.append((name, addr, 0x80000000 | size))
+    ents.append(("@@END", 0, 0))
+    head = 8 + 12 * len(ents) + 4
+    names = b""
+    rows = b""
+    chars = 0
+    for name, addr, n in ents:
+        rows += struct.pack("<III", PRINT_TABLE + head + len(names), addr, n)
+        names += name.encode() + b"\0"
+        chars += len(name) + 1 + (n & 0x7FFFFFFF) * (1 if n >> 31 else 9) + 1
+    blob = struct.pack("<II", ctrl, MBX + MBX_PRINT_DONE) + rows + b"\0" * 4 + names
+    if PRINT_TABLE + len(blob) > BUF:
+        sys.exit("result table does not fit below the staging buffer")
+    return blob, chars
+
+
 # --------------------------------------------------------------------------
-def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss, uart_ctrl=None):
+def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss, uart_ctrl=None,
+                 print_ctrl=None):
     """uart_ctrl: UART1 CTRL word to stream DDR segments over the USB-UART
-    instead of JTAG; the payloads to send are returned in `uart`."""
+    instead of JTAG; the payloads to send are returned in `uart`.
+    print_ctrl: UART1 CTRL word for tools/result_printer.S; when the crt0 tail
+    is found, the board prints every result symbol on the UART at the end."""
     entry, segs, syms = read_elf(elf)
+    printing = 0
+    if print_ctrl is not None:
+        for s in segs:
+            k = s["data"].find(CRT0_TAIL, 0, 0x1000)
+            if s["addr"] >= DDR_BASE and k >= 0 and k % 4 == 0:
+                s["data"] = s["data"][:k] + CRT0_TO_PRINTER + s["data"][k + 8:]
+                print("==> crt0 tail at %#x -> board prints the results on the UART"
+                      % (s["addr"] + k))
+                printing = 1
+                break
+        else:
+            print("==> no known crt0 tail in %s; the board will not print" % elf)
     ddr = [s for s in segs if s["addr"] >= DDR_BASE]
     tcm = [s for s in segs if s["addr"] < DDR_BASE]
     for s in tcm:
@@ -131,6 +203,14 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss, uart_ctrl=N
     stub = os.path.join(tmp, "stub.bin")
     with open(stub, "wb") as f:
         f.write(struct.pack("<%dI" % len(STUB_WORDS), *STUB_WORDS))
+    if printing:
+        printer = os.path.join(tmp, "printer.bin")
+        with open(printer, "wb") as f:
+            f.write(struct.pack("<%dI" % len(PRINTER_WORDS), *PRINTER_WORDS))
+        table = os.path.join(tmp, "print_table.bin")
+        blob, print_chars = print_table(syms, os.path.basename(elf), print_ctrl)
+        with open(table, "wb") as f:
+            f.write(blob)
 
     L = []
     w = L.append
@@ -168,6 +248,9 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss, uart_ctrl=N
     w("catch {riscv set_ebreakm off}")   # ebreak in the program traps, as on Nexus
     w("if {[catch {reset halt}]} { halt }")
     w("load_image %s 0x0 bin" % stub)
+    if printing:
+        w("load_image %s %#x bin" % (printer, PRINTER))
+        w("load_image %s %#x bin" % (table, PRINT_TABLE))
     # Seed the GPIO slot with a value the stub can never store, so a 0x0 read
     # back means GPIO really is 0 and not that the stub never got that far.
     w("mww %d 0; mww %d 0; mww %d %d" % (MBX, MBX + 16, MBX + MBX_GPIO, GPIO_UNSEEN))
@@ -257,6 +340,8 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss, uart_ctrl=N
 
     # Go.
     w("echo \"DDRLOAD: start %#x\"" % entry)
+    if printing:
+        w("mww %d 0" % (MBX + MBX_PRINT_DONE))
     w("mww %d %#x; mww %d 4" % (MBX + 8, entry, MBX))
     w("set t0 [clock seconds]")
     w("resume")
@@ -269,6 +354,20 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss, uart_ctrl=N
         w("  resume")
         w("}")
         w("echo \"DDRLOAD: finished $fin after [expr {[clock seconds] - $t0}] s\"")
+        if printing:
+            # The program is done but the board may still be printing: let it
+            # run until the printer stores its done flag. Halting in between
+            # only pauses the UART, it loses nothing on the TX side.
+            baud = ((print_ctrl >> 16) * CLK_HZ) >> 20
+            secs = print_chars * 10 // baud * 3 + 30
+            w("if {$fin} {")
+            w("  set pd 0; set t1 [clock seconds]")
+            w("  while {[clock seconds] - $t1 < %d} {" % secs)
+            w("    resume; sleep 500; halt")
+            w("    if {[mbx %d] == %d} { set pd 1; break }" % (MBX_PRINT_DONE, PRINT_DONE))
+            w("  }")
+            w("  echo \"DDRLOAD: board printed $pd after [expr {[clock seconds] - $t1}] s\"")
+            w("}")
     else:
         w("sleep %d; halt" % (run_timeout * 1000))
     w("echo \"DDRLOAD: pc [reg pc]\"")
@@ -289,7 +388,7 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss, uart_ctrl=N
     script = os.path.join(tmp, "ddr_run.tcl")
     with open(script, "w") as f:
         f.write("\n".join(L) + "\n")
-    return script, entry, segs, syms, total, n, uart
+    return script, entry, segs, syms, total, n, uart, printing
 
 
 def words_to_text(ws):
@@ -335,6 +434,40 @@ def uart_send(fd, data):
     termios.tcdrain(fd)
 
 
+class UartReader(threading.Thread):
+    """Collects everything the board sends while OpenOCD runs; the tty buffer
+    is only a few KB and yolo's output alone is ~2 MB of text."""
+
+    def __init__(self, fd):
+        super().__init__(daemon=True)
+        self.fd, self.buf, self.stop = fd, bytearray(), threading.Event()
+
+    def run(self):
+        while not self.stop.is_set():
+            if select.select([self.fd], [], [], 0.2)[0]:
+                self.buf += os.read(self.fd, 65536)
+
+
+def board_results(raw):
+    """Lines between @@BEGIN and @@END as {name: rest}, plus the raw text."""
+    text = raw.decode("latin-1")
+    i, j = text.find("@@BEGIN"), text.find("@@END")
+    if i < 0 or j < i:
+        return None, text
+    lines = {}
+    for ln in text[i:j].splitlines()[1:]:
+        name, _, rest = ln.partition(" ")
+        if name:
+            lines[name] = rest
+    return lines, text[i:j + len("@@END")] + "\n"
+
+
+def results_dir():
+    # In the VM the shared folder carries the files to Windows (vmshare).
+    share = "/media/sf_coral"
+    return os.path.join(share, "results") if os.path.isdir(share) else os.path.join("out", "results")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -350,6 +483,8 @@ def main():
                     help="USB-UART tty: send the DDR segments over it instead of JTAG")
     ap.add_argument("--baud", type=int, default=921600)
     ap.add_argument("--jtag", action="store_true", help="load over JTAG even if --uart is given")
+    ap.add_argument("--no-print", action="store_true",
+                    help="do not patch crt0 to make the board print its results on the UART")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--keep", action="store_true", help="keep the temp directory")
     a = ap.parse_args()
@@ -361,9 +496,10 @@ def main():
         print("==> no UART at %r; loading over JTAG" % a.uart)
         use_uart = False
     tmp = tempfile.mkdtemp(prefix="ddr_run_")
-    script, entry, segs, syms, total, n, uart = build_script(
+    script, entry, segs, syms, total, n, uart, printing = build_script(
         a.elf, tmp, a.chunk, a.timeout, a.poll, a.zero_ddr_bss,
-        uart_ctrl_word(a.baud) if use_uart else None)
+        uart_ctrl_word(a.baud) if use_uart else None,
+        None if a.no_print else uart_ctrl_word(a.baud))
     print("==> %s: entry %#x, %d KB to DDR in %d pieces over %s" % (
         a.elf, entry, total // 1024, n, "%s @ %d" % (a.uart, a.baud) if use_uart else "JTAG"))
     for s in segs:
@@ -373,6 +509,10 @@ def main():
         return
 
     fd = open_uart(a.uart, a.baud) if use_uart else None
+    reader = None
+    if fd is not None and printing:
+        reader = UartReader(fd)
+        reader.start()
     t0 = time.time()
     proc = subprocess.Popen(["openocd", "-f", a.cfg, "-f", script],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -395,6 +535,27 @@ def main():
             parts = line.split()
             res[parts[1]] = parts[2:]
     rc = proc.wait()
+    board = None
+    if reader is not None:
+        deadline = time.time() + 3
+        while b"@@END" not in reader.buf and time.time() < deadline:
+            time.sleep(0.1)
+        reader.stop.set()
+        reader.join()
+        board, text = board_results(bytes(reader.buf))
+        os.makedirs(results_dir(), exist_ok=True)
+        outf = os.path.join(results_dir(), "%s-%s.uart.txt" % (
+            os.path.basename(a.elf), time.strftime("%Y%m%d-%H%M%S")))
+        with open(outf, "w") as f:
+            f.write(text)
+        if board is None:
+            print("==> board UART: no @@BEGIN..@@END (%d bytes received); raw text in %s"
+                  % (len(reader.buf), outf))
+        else:
+            print("==> board UART output (%d lines, full text in %s)" % (len(board) + 2, outf))
+            for ln in text.splitlines():
+                print("    | " + (ln if len(ln) <= 160 else
+                                  ln[:160] + " ... (%d words)" % (len(ln.split()) - 1)))
     if fd is not None:
         os.close(fd)
     logf = os.path.join(tmp, "openocd.log")
@@ -430,6 +591,15 @@ def main():
             for i in range(0, min(cnt, 64), 8):
                 print("      %3d: %s" % (i, " ".join(ws[i:i + 8])))
                 print("           %s" % " ".join("%8.4g" % f32(x) for x in ws[i:i + 8]))
+    if board is not None:
+        # The two paths are independent (UART from the board, JTAG from the
+        # debugger), so they have to agree on every value both of them read.
+        diff = [name for name in RESULT_SYMS + ARRAY_SYMS
+                if name in res and name in board
+                and board[name].split()[:len(res[name])] != res[name][:len(board[name].split())]]
+        both = sum(1 for name in RESULT_SYMS + ARRAY_SYMS if name in res and name in board)
+        print("==> board UART vs debugger: %s" % (
+            "%d symbols identical" % both if not diff else "DIFFER in " + ", ".join(diff)))
     print("==> total %.1f s, OpenOCD log %s" % (time.time() - t0, logf))
     if not a.keep:
         for f in os.listdir(tmp):
