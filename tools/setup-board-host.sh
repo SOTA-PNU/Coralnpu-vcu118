@@ -56,8 +56,11 @@ elif [[ -z "${lab}" ]]; then
   [[ -n "${xsetup}" ]] || die "no xsetup in ${tarball}"
   sudo mkdir -p /tools/Xilinx && sudo chown "$(id -u):$(id -g)" /tools/Xilinx
   cfg="${stage}/install_config.txt"
-  "${xsetup}" -b ConfigGen -p "Vivado Lab Edition" -e "Vivado Lab Edition (Standalone)" -c "${cfg}" >/dev/null 2>&1 ||
-    "${xsetup}" -b ConfigGen   # interactive fallback: pick Vivado Lab Edition
+  # 2026.1 rejects -p/-e here and falls into its edition menu, which over
+  # SSH without a tty repeats "Not a valid choice" forever. The Lab tarball
+  # offers one edition, so answer the menu with 1 (11/04, sota-AIP).
+  "${xsetup}" -b ConfigGen -p "Vivado Lab Edition" -e "Vivado Lab Edition (Standalone)" -c "${cfg}" >/dev/null 2>&1 < /dev/null ||
+    printf '1\n' | timeout 300 "${xsetup}" -b ConfigGen
   [[ -f "${cfg}" ]] || cfg="$(ls -t "${HOME}"/.Xilinx/install_config.txt 2>/dev/null | head -n1)"
   sed -i 's|^Destination=.*|Destination=/tools/Xilinx|' "${cfg}"
   "${xsetup}" --agree XilinxEULA,3rdPartyEULA --batch Install --config "${cfg}"
@@ -70,10 +73,21 @@ step "JTAG cable driver (lets hw_server see the Digilent cable)"
 if ls /etc/udev/rules.d/*digilent* /etc/udev/rules.d/52-xilinx-*.rules >/dev/null 2>&1; then
   ok "installed"
 else
-  drv="$(find "${lab}" -path '*cable_drivers/lin64/install_script/install_drivers/install_drivers' 2>/dev/null | head -n1)"
-  [[ -n "${drv}" ]] || die "install_drivers not found under ${lab}"
+  # 2026.1 keeps the drivers next to Vivado_Lab (<ver>/data/xicom/...), not in it
+  drv="$(find "$(dirname "${lab}")" -path '*cable_drivers/lin64/install_script/install_drivers/install_drivers' 2>/dev/null | head -n1)"
+  [[ -n "${drv}" ]] || die "install_drivers not found under $(dirname "${lab}")"
   (cd "$(dirname "${drv}")" && sudo ./install_drivers)
-  ok "installed (unplug and re-plug the JTAG USB once)"
+  # A udev retrigger was enough on sota-AIP (no replug needed, 11/04)
+  sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb
+  ok "installed (if hw_server does not see the cable, unplug and re-plug the JTAG USB once)"
+fi
+
+step "locale en_US.UTF-8 (vivado_lab forces it and aborts without it)"
+if locale -a 2>/dev/null | grep -qi '^en_US\.utf-\?8$'; then
+  ok "present"
+else
+  sudo locale-gen en_US.UTF-8 >/dev/null   # adds it; the system default stays as it is
+  ok "generated"
 fi
 
 step "board on USB"
