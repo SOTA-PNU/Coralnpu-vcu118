@@ -62,7 +62,7 @@ VM 메일박스로는 `vmshare/inbox/NN-name.job` 에 `model <~/models 안의 �
 | lenet5 | 821 KB | 11.2 s | 640 s | 2 s (`cyc_invoke` 560.6 ms) | 7 |
 | charrnn | 2062 KB | 27.9 s | 1600 s | 4 s (`cyc_invoke` 3173.6 ms) | 53 |
 | yolo | 12333 KB | 166.9 s | 9612 s | 736 s | 959 |
-| vgg | 15869 KB | | | | |
+| vgg | 15868 KB | 215.6 s | (약 3.4 h, 외삽) | 94 s (`cyc_invoke` 82.5 s) | 92 |
 
 UART 는 약 73.8 KB/s, JTAG 는 약 1.29 KB/s. UART 와 JTAG 로 적재한 결과는 출력값까지 같다.
 argmax 가 정답인지는 기준값(입력 라벨이나 호스트 실행 결과)이 없어 아직 판정하지 않았다.

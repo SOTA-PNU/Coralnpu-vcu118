@@ -232,6 +232,31 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 - 17:35 vector_highmem 빌드 시작 (0013 적용, 끝나면 모델 4개 자동 실행)
 - 미측정: E12 에 250 MHz 가 실제로 들어오는지 (빌드 결과의 LED 5 / GPIO 비트 1 로 확인)
 
+## [11/04] DDR4 동작, 모델 4개 보드 실행 — 진짜 원인은 로더
+
+- 0013 판 빌드 17:35 → 06:57 (**13시간 22분**: VM 메모리 13/15 GB + swap, 그동안 VM 에이전트도 멈춤). clk_main WNS +0.229, LUT 45.60%
+- RVV, matmul PASS. lenet5 는 또 GPIO = 0x0, 이번엔 eos=0 까지 → 설정이 끝난 FPGA 에서 EOS 는 항상 1 이므로 이 0 은 GPIO 값이 아님
+- 확인: 메일박스 GPIO 칸을 `0xA5A5A5A5` 로 채우고 실행 → 그대로 남음, 스텁 pc 는 0x8 → 0xc → 0xc
+- **원인:** 상류 `Lsu.scala` 는 코어의 ITCM store 를 access fault 로 처리(`ibusFault = write && itcm`). 스텁 메일박스가 ITCM 0x100 이라 첫 `sw` 에서 fault → 0 번지로 돌아가 무한 반복
+  - **0011·0012·0013 의 "GPIO = 0x0" 은 측정이 아니라 로더가 써 둔 초기값이었다.** 그 판들의 실제 DDR4 상태는 알 수 없음
+  - "읽는 쪽이 살아 있다는 증거"를 계측에 넣지 않은 탓. 앞으로 센티널 필수
+- 수정: 메일박스를 DTCM `0x1F_F000` 으로 (`li s0` 한 워드만 바뀜) → **`DDR calibrated` 0.4 s**
+- 0013 이 실제로 필요했는지는 미확정 (0013 없는 판을 같은 로더로 돌려 보지 않음). 0013 없이 만든 IP 의 VCO 4250 MHz 계산은 그대로 유효
+- JTAG 적재 실측 1.29 KB/s (워드마다 abstract command + USB 왕복) → yolo 2.7 h, vgg 3.4 h
+- **UART 로더** (재빌드 없음): UART1 RX 는 0001 부터 CP2105 에 연결돼 있었음. 스텁 cmd 5 = UART1 에서 n 바이트를 DDR 로. 호스트는 termios 921600 8N1
+  - 실측 **73.8 KB/s (JTAG 의 57 배)**, 체크섬·출력값 JTAG 와 동일
+- 결과 ([MODEL_ELF.md](MODEL_ELF.md) 에 실행 조건과 함께 정리)
+
+| 모델 | UART 적재 | 실행 | argmax | `_ret` |
+|---|---|---|---|---|
+| lenet5 (821 KB) | 11.2 s | 2 s (560.6 ms) | 7 | 0 |
+| charrnn (2062 KB) | 27.9 s | 4 s (3173.6 ms) | 53 | 0 |
+| yolo (12333 KB) | 166.9 s | 736 s | 959 | 0 |
+| vgg (15868 KB) | 215.6 s | 94 s (82.5 s) | 92 | 0 |
+
+- 정답 여부는 미판정 (기준값 없음). `cyc_*` 는 32비트라 86 초마다 넘침 — 긴 실행은 벽시계 기준
+- OpenOCD 0.11 이 생성 설정의 `riscv set_mem_access abstract` 를 모름 (오류 출력, 동작엔 무관)
+
 ## [진행 예정]
 
 - (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음
@@ -239,8 +264,9 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 - (급하지 않음) 보드를 학교 Linux 서버 PC 로 이전: `tools/setup-board-host.sh` → 보드 USB·전원 이동 → VM 에서 .bit / openocd cfg / ~/models 복사 → `coral program`, `coral model`
 - 보드에 올린 ELF 에 벡터 명령이 실제로 들어 있는지 objdump 로 확인
 - 행렬곱 커널 최적화 (레지스터 블로킹), 신경망 레이어 단위 측정
-- JTAG 적재 속도: lenet5(821 KB) 적재 시간을 재서 vgg(15.9 MB) 추정 (progbufsize=0 → 워드마다 abstract command)
-- 0013 판 결과 확인: GPIO 비트 0/1, 모델 4개 실행, 힙 실사용량
-- DDR4 가 끝내 안 되면: 0x8000_0000 에 DDR4 대신 온칩 BRAM/URAM (ELF 무수정, 약 36 MB 여유)
+- 모델 출력 정답 판정: 입력 라벨 또는 호스트 실행 결과 확보
+- 보드를 AIP 공용 Linux 서버로 이전 (`tools/setup-board-host.sh`), 이후 보드 CI (self-hosted 러너)
+- 빌드 전용 PC: 0013 판이 메모리 부족으로 13 시간
+- 힙 실사용량, 64비트 사이클 카운터(mcycleh)로 긴 실행 측정
 - `overnight.sh` 가 빌드 단계(synth/P&R/비트스트림)를 summary 에 기록
 - 상류 결함 보고: autoboot 리셋 net 선언 순서 (Nexus ROM 빌드도 같은 문제로 추정)
