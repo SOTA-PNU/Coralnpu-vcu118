@@ -55,19 +55,24 @@ STUB_WORDS = [
 # tools/result_printer.S assembled at PRINTER (rvasm.pl --check covers it too).
 PRINTER = 0x400
 PRINTER_WORDS = [
-    0x400103b7, 0x000004b7, 0x50848493, 0x00001437, 0x80040413,
-    0x00042e03, 0x000e0463, 0x01c3a823, 0x00840413, 0x00042683,
-    0x08068e63, 0x00442703, 0x00842783, 0x00c40413, 0x0006c503,
-    0x00050863, 0x0b4000ef, 0x00168693, 0xff1ff06f, 0x0407c063,
-    0x06078463, 0x02000513, 0x09c000ef, 0x00072803, 0x00800893,
-    0x01c85513, 0x00950533, 0x00054503, 0x084000ef, 0x00481813,
-    0xfff88893, 0xfe0894e3, 0x00470713, 0xfff78793, 0xfc9ff06f,
-    0x00179793, 0x0017d793, 0x02000513, 0x05c000ef, 0x00078e63,
-    0x00074503, 0x00050a63, 0x04c000ef, 0x00170713, 0xfff78793,
-    0xfe9ff06f, 0x00a00513, 0x038000ef, 0xf65ff06f, 0x0143af03,
-    0x008f7f13, 0xfe0f0ce3, 0x00001eb7, 0x800e8e93, 0x004eae83,
-    0x0d0e1e37, 0xd0ee0e13, 0x01cea023, 0x0ff0000f, 0x08000073,
-    0x0000006f, 0x0143af03, 0x001f7f13, 0xfe0f1ce3, 0x00a3ae23,
+    0x400103b7, 0x000004b7, 0x56c48493, 0x00001437, 0x80040413,
+    0x00042e03, 0x000e0463, 0x01c3a823, 0x00842a83, 0x00000913,
+    0x00c40413, 0x00042683, 0x0a068263, 0x00442703, 0x00842783,
+    0x00c40413, 0x0006c503, 0x00050863, 0x0e0000ef, 0x00168693,
+    0xff1ff06f, 0x0407c463, 0x00000993, 0x02078263, 0x02000513,
+    0x0c4000ef, 0x00072803, 0x010989b3, 0x09400a6f, 0x00470713,
+    0xfff78793, 0xfe1ff06f, 0x02000513, 0x0a4000ef, 0x03d00513,
+    0x09c000ef, 0x00098833, 0x07000a6f, 0x0300006f, 0x00179793,
+    0x0017d793, 0x02000513, 0x080000ef, 0x00078e63, 0x00074503,
+    0x00050a63, 0x070000ef, 0x00170713, 0xfff78793, 0xfe9ff06f,
+    0x00a00513, 0x05c000ef, 0xf5dff06f, 0x0143af03, 0x008f7f13,
+    0xfe0f0ce3, 0x00001eb7, 0x800e8e93, 0x004eae83, 0x0d0e1e37,
+    0xd0ee0e13, 0x01cea023, 0x0ff0000f, 0x08000073, 0x0000006f,
+    0x00800893, 0x01c85513, 0x00950533, 0x00054503, 0x014000ef,
+    0x00481813, 0xfff88893, 0xfe0894e3, 0x000a0067, 0x0143af03,
+    0x001f7f13, 0xfe0f1ce3, 0x00a3ae23, 0x020a8863, 0x00190913,
+    0x03596463, 0x00000913, 0x01000fb7, 0x0143af03, 0x020f7f13,
+    0x000f0863, 0xffff8f93, 0xfe0f98e3, 0x0080006f, 0x0183af03,
     0x00008067, 0x33323130, 0x37363534, 0x62613938, 0x66656463,
     0x00000000,
 ]
@@ -143,7 +148,7 @@ def wsum(b):
     return sum(struct.unpack("<%dI" % (len(b) // 4), b)) & 0xFFFFFFFF
 
 
-def print_table(syms, label, ctrl):
+def print_table(syms, label, ctrl, ack_block):
     """ITCM image for PRINT_TABLE: header, {name, addr, n} entries, labels.
     Returns (bytes, characters the board will print)."""
     ents = [("@@BEGIN " + label, 0, 0)]
@@ -156,15 +161,15 @@ def print_table(syms, label, ctrl):
             addr, size = syms[name]
             ents.append((name, addr, 0x80000000 | size))
     ents.append(("@@END", 0, 0))
-    head = 8 + 12 * len(ents) + 4
+    head = 12 + 12 * len(ents) + 4
     names = b""
     rows = b""
     chars = 0
     for name, addr, n in ents:
         rows += struct.pack("<III", PRINT_TABLE + head + len(names), addr, n)
         names += name.encode() + b"\0"
-        chars += len(name) + 1 + (n & 0x7FFFFFFF) * (1 if n >> 31 else 9) + 1
-    blob = struct.pack("<II", ctrl, MBX + MBX_PRINT_DONE) + rows + b"\0" * 4 + names
+        chars += len(name) + 1 + (n & 0x7FFFFFFF if n >> 31 else 9 * n + 10) + 1
+    blob = struct.pack("<III", ctrl, MBX + MBX_PRINT_DONE, ack_block) + rows + b"\0" * 4 + names
     if PRINT_TABLE + len(blob) > BUF:
         sys.exit("result table does not fit below the staging buffer")
     return blob, chars
@@ -172,7 +177,7 @@ def print_table(syms, label, ctrl):
 
 # --------------------------------------------------------------------------
 def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss, uart_ctrl=None,
-                 print_ctrl=None):
+                 print_ctrl=None, print_ack=0):
     """uart_ctrl: UART1 CTRL word to stream DDR segments over the USB-UART
     instead of JTAG; the payloads to send are returned in `uart`.
     print_ctrl: UART1 CTRL word for tools/result_printer.S; when the crt0 tail
@@ -208,7 +213,7 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss, uart_ctrl=N
         with open(printer, "wb") as f:
             f.write(struct.pack("<%dI" % len(PRINTER_WORDS), *PRINTER_WORDS))
         table = os.path.join(tmp, "print_table.bin")
-        blob, print_chars = print_table(syms, os.path.basename(elf), print_ctrl)
+        blob, print_chars = print_table(syms, os.path.basename(elf), print_ctrl, print_ack)
         with open(table, "wb") as f:
             f.write(blob)
 
@@ -360,6 +365,8 @@ def build_script(elf, tmp, chunk, run_timeout, poll_s, zero_ddr_bss, uart_ctrl=N
             # only pauses the UART, it loses nothing on the TX side.
             baud = ((print_ctrl >> 16) * CLK_HZ) >> 20
             secs = print_chars * 10 // baud * 3 + 30
+            if print_ack:       # plus up to 20 ms of host round trip per ack
+                secs += print_chars // print_ack // 50
             w("if {$fin} {")
             w("  set pd 0; set t1 [clock seconds]")
             w("  while {[clock seconds] - $t1 < %d} {" % secs)
@@ -434,22 +441,49 @@ def uart_send(fd, data):
     termios.tcdrain(fd)
 
 
+PRINT_ACK_BLOCK = 256  # board waits for one ack byte after this many bytes
+
+
 class UartReader(threading.Thread):
     """Collects everything the board sends while OpenOCD runs; the tty buffer
-    is only a few KB and yolo's output alone is ~2 MB of text."""
+    is only a few KB and yolo's output alone is ~2 MB of text.
+
+    Once `acking` is set (after the DDR load, so no ack can land in the data
+    the stub is receiving), it acks every PRINT_ACK_BLOCK bytes counted from
+    @@BEGIN, as the printer expects. If bytes were lost the count lags and the
+    board would wait for an ack that never comes, so an idle 0.2 s while the
+    board is mid-output also sends one."""
 
     def __init__(self, fd):
         super().__init__(daemon=True)
         self.fd, self.buf, self.stop = fd, bytearray(), threading.Event()
+        self.acking, self.begin, self.acks = False, None, 0
+
+    def ack(self, n):
+        os.write(self.fd, b"\x06" * n)
+        self.acks += n
 
     def run(self):
         while not self.stop.is_set():
             if select.select([self.fd], [], [], 0.2)[0]:
                 self.buf += os.read(self.fd, 65536)
+                if not self.acking:
+                    continue
+                if self.begin is None:
+                    k = self.buf.find(b"@@BEGIN")
+                    self.begin = k if k >= 0 else None
+                if self.begin is not None:
+                    due = (len(self.buf) - self.begin) // PRINT_ACK_BLOCK - self.acks
+                    if due > 0:
+                        self.ack(due)
+            elif self.acking and self.begin is not None and b"@@END" not in self.buf:
+                self.ack(1)
 
 
 def board_results(raw):
-    """Lines between @@BEGIN and @@END as {name: rest}, plus the raw text."""
+    """Lines between @@BEGIN and @@END as {name: (words or text, sum ok)},
+    plus the raw text. Word lines end in "=<sum>", the board's own 32-bit sum
+    of what it sent; None means a text line (no sum)."""
     text = raw.decode("latin-1")
     i, j = text.find("@@BEGIN"), text.find("@@END")
     if i < 0 or j < i:
@@ -457,8 +491,19 @@ def board_results(raw):
     lines = {}
     for ln in text[i:j].splitlines()[1:]:
         name, _, rest = ln.partition(" ")
-        if name:
-            lines[name] = rest
+        if not name:
+            continue
+        toks = rest.split()
+        if toks and toks[-1].startswith("="):
+            words = toks[:-1]
+            try:
+                ok = (sum(int(x, 16) for x in words) & 0xFFFFFFFF) == int(toks[-1][1:], 16) \
+                    and all(len(x) == 8 for x in words)
+            except ValueError:
+                ok = False
+            lines[name] = (words, ok)
+        else:
+            lines[name] = (rest, None)
     return lines, text[i:j + len("@@END")] + "\n"
 
 
@@ -499,7 +544,8 @@ def main():
     script, entry, segs, syms, total, n, uart, printing = build_script(
         a.elf, tmp, a.chunk, a.timeout, a.poll, a.zero_ddr_bss,
         uart_ctrl_word(a.baud) if use_uart else None,
-        None if a.no_print else uart_ctrl_word(a.baud))
+        None if a.no_print else uart_ctrl_word(a.baud),
+        PRINT_ACK_BLOCK if use_uart else 0)
     print("==> %s: entry %#x, %d KB to DDR in %d pieces over %s" % (
         a.elf, entry, total // 1024, n, "%s @ %d" % (a.uart, a.baud) if use_uart else "JTAG"))
     for s in segs:
@@ -522,6 +568,8 @@ def main():
         log.append(line)
         if line.startswith("DDRLOAD:"):
             print("    %6.1fs %s" % (time.time() - t0, line.rstrip()), flush=True)
+            if reader is not None and line.startswith("DDRLOAD: start"):
+                reader.acking = True
             m = re.match(r"DDRLOAD: UART GO (\d+)", line)
             if m and fd is not None:
                 data, flag = uart[int(m.group(1))]
@@ -555,7 +603,12 @@ def main():
             print("==> board UART output (%d lines, full text in %s)" % (len(board) + 2, outf))
             for ln in text.splitlines():
                 print("    | " + (ln if len(ln) <= 160 else
-                                  ln[:160] + " ... (%d words)" % (len(ln.split()) - 1)))
+                                  ln[:160] + " ... (%d words)" % (len(ln.split()) - 2)))
+            sums = [name for name, (_, ok) in board.items() if ok is not None]
+            bad = [name for name in sums if not board[name][1]]
+            print("==> board line sums: %s (%d acks sent)" % (
+                "%d/%d ok" % (len(sums), len(sums)) if not bad else "BAD in " + ", ".join(bad),
+                reader.acks))
     if fd is not None:
         os.close(fd)
     logf = os.path.join(tmp, "openocd.log")
@@ -596,7 +649,7 @@ def main():
         # debugger), so they have to agree on every value both of them read.
         diff = [name for name in RESULT_SYMS + ARRAY_SYMS
                 if name in res and name in board
-                and board[name].split()[:len(res[name])] != res[name][:len(board[name].split())]]
+                and board[name][0][:len(res[name])] != res[name][:len(board[name][0])]]
         both = sum(1 for name in RESULT_SYMS + ARRAY_SYMS if name in res and name in board)
         print("==> board UART vs debugger: %s" % (
             "%d symbols identical" % both if not diff else "DIFFER in " + ", ".join(diff)))
