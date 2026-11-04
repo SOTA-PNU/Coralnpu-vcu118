@@ -1,0 +1,114 @@
+name: board-test
+
+# Runs the VCU118 on the lab server sota-AIP (192.168.1.150), where the board
+# hangs off USB: program the 0013 bitstream, RVV and matmul regressions, then
+# the IREE models with the UART loader and the board's own UART output.
+#
+# Self-hosted only: GitHub's cloud runners cannot reach the board (campus
+# firewall, as nestc found), and builds stay off CI (Vivado license on the
+# build VM, 9+ hours). Only manual and scheduled triggers -- no pull_request,
+# so code from forks never runs on the lab server.
+#
+# Runner prerequisites on the server (tools/setup-board-host.sh does them):
+#   Vivado Lab 2026.1 under /tools/Xilinx, openocd, udev rule, cable drivers.
+# Board files live outside the checkout, because they come from the build VM:
+#   $BOARD_OUT  chip_vcu118_vector_highmem.bit, openocd_vcu118.cfg,
+#               vcu118_{rvv_test,matmul_bench}_highmem.elf
+#   $MODELS     lenet5 charrnn yolo vgg (IREE ELFs)
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: "models to run, space separated (yolo alone is ~16 min)"
+        type: string
+        default: "lenet5 charrnn vgg"
+      program:
+        description: "load the bitstream first (40 s; turn off to test the board as it is)"
+        type: boolean
+        default: true
+  schedule:
+    - cron: "0 19 * * 0"   # Mondays 04:00 KST, all four models
+
+# One board: never two runs on it at once, and never cancel a run mid-load.
+concurrency:
+  group: vcu118-board
+  cancel-in-progress: false
+
+env:
+  CONFIG: vector_highmem
+  BOARD_OUT: /home/ehdgns/Coralnpu-vcu118/out
+  MODELS: /home/ehdgns/models
+
+jobs:
+  vcu118:
+    runs-on: [self-hosted, linux, vcu118]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: board files
+        run: |
+          set -eu
+          rm -rf out && ln -s "$BOARD_OUT" out
+          ls -l out/chip_vcu118_${CONFIG}.bit out/openocd_vcu118.cfg
+          (cd out && sha256sum -c SHA256SUMS --ignore-missing)
+          (cd "$MODELS" && sha256sum -c SHA256SUMS)
+          lsusb | grep -E "0403:6014|10c4:ea70"
+
+      - name: program
+        if: github.event_name == 'schedule' || inputs.program
+        run: ./coral program 2>&1 | tail -5
+
+      - name: RVV
+        run: |
+          ./coral run out/vcu118_rvv_test_highmem.elf 2>&1 | tee rvv.log | tail -12
+          grep -q "RVV PASS" rvv.log
+
+      - name: matmul
+        run: |
+          ./coral run out/vcu118_matmul_bench_highmem.elf 2>&1 | tee matmul.log | tail -6
+          grep -q "MATMUL PASS" matmul.log
+
+      # Each model must: return 0, have every line sum of its UART output
+      # check out, agree with the debugger on every symbol both read, and
+      # keep the argmax measured on 11/04 (a regression check, not a proof
+      # the answer is right: there is no reference output yet).
+      - name: models
+        run: |
+          set -u
+          declare -A want=([lenet5]=00000007 [charrnn]=00000035 [yolo]=000003bf [vgg]=0000005c)
+          list="${{ inputs.models }}"
+          [ "${{ github.event_name }}" = schedule ] && list="lenet5 charrnn vgg yolo"
+          fail=0
+          for m in $list; do
+            t=900; [ "$m" = yolo ] && t=2400; [ "$m" = vgg ] && t=1800
+            echo "::group::$m"
+            ./coral model "$MODELS/$m" --timeout $t > "model_$m.log" 2>&1
+            rc=$?
+            grep -E "UART sent|checksum ok|finished|board printed|board line sums|UART vs debugger|_ret |inference_argmax |total" "model_$m.log"
+            echo "::endgroup::"
+            ok=1
+            [ $rc -eq 0 ] || ok=0
+            grep -qE "_ret +00000000" "model_$m.log" || ok=0
+            grep -qE "board line sums: ([0-9]+)/\1 ok" "model_$m.log" || ok=0
+            grep -qE "board UART vs debugger: [0-9]+ symbols identical" "model_$m.log" || ok=0
+            [ -z "${want[$m]:-}" ] || grep -qE "inference_argmax +${want[$m]}" "model_$m.log" || ok=0
+            if [ $ok = 1 ]; then echo "PASS $m"; else echo "::error::FAIL $m (see model_$m.log)"; fail=1; fi
+          done
+          exit $fail
+
+      - name: collect logs
+        if: always()
+        run: |
+          mkdir -p ci-logs
+          cp -f rvv.log matmul.log model_*.log ci-logs/ 2>/dev/null || true
+          find out/results -newer rvv.log -name '*.uart.txt' -size -4M -exec cp {} ci-logs/ \; 2>/dev/null || true
+          ls -la ci-logs
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vcu118-board-test
+          path: ci-logs/
+          retention-days: 30
