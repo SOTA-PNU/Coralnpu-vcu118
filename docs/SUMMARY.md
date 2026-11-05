@@ -2,7 +2,8 @@
 
 Google CoralNPU(RISC-V 스칼라 + RVV 벡터 NPU)를 AMD VCU118(xcvu9p-flga2104-2L-e)에 올리고,
 받은 IREE 모델 4종을 보드에서 끝까지 추론한 것으로 프로젝트를 마무리한다.
-진행 기록은 [LOG.md](LOG.md), 모델 ELF 조건은 [MODEL_ELF.md](MODEL_ELF.md).
+진행 기록은 [LOG.md](LOG.md), 모델 ELF 조건은 [MODEL_ELF.md](MODEL_ELF.md),
+반복 측정·효율·다른 구현과의 비교는 [BENCHMARK.md](BENCHMARK.md).
 
 ## 1. 결과 요약
 
