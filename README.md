@@ -1,142 +1,173 @@
 # Coralnpu-vcu118
 
-Google [CoralNPU](https://github.com/google-coral/coralnpu) SoC 를 AMD **VCU118**
-(xcvu9p-flga2104-2L-e) 에 올리는 저장소.
+Google [CoralNPU](https://github.com/google-coral/coralnpu)(RISC-V 스칼라 + RVV 벡터 NPU)를
+AMD **VCU118**(xcvu9p-flga2104-2L-e)에 올리고, IREE로 컴파일한 신경망 모델을 보드에서 실행하는 저장소.
 
-이 저장소는 상류 코드를 복사해 두지 않는다. **고정된 상류 커밋 + `patches/`** 만 들고 있고,
-스크립트가 그 둘을 합쳐서 빌드·다운로드·실행까지 한다.
+**상태 (2026-11-04, 마무리):** IREE 모델 4종(lenet5, charrnn, yolo, vgg)이 보드에서 끝까지 추론된다.
+보드는 연구실 서버 sota-AIP에 있고, GitHub Actions `board-test`가 매주 검증한다.
+
+| 문서 | 내용 |
+|---|---|
+| [docs/SUMMARY.md](docs/SUMMARY.md) | **프로젝트 정리**: 결과, 리소스, 동작 방식, 한계, 운영, 올리는 법 |
+| [docs/BENCHMARK.md](docs/BENCHMARK.md) | 반복 측정, MAC 효율, 다른 구현과 비교 |
+| [docs/MODEL_ELF.md](docs/MODEL_ELF.md) | 어떤 모델 ELF가 돌아가는지 (명령어 셋, 메모리 배치, 결과 심볼) |
+| [docs/LOG.md](docs/LOG.md) | 날짜별 진행 기록과 측정값 |
+
+## 한눈에
+
+| 항목 | 값 (보드 실측) |
+|---|---|
+| 구성 | `vector_highmem`: 스칼라 RV32IMF + RVV(VLEN 128), ITCM 1 MB, DTCM 1 MB, DDR4 |
+| 클럭 / 리소스 | 50 MHz, WNS +0.229 ns, LUT 45.6 % |
+| 행렬 곱 | int8 128³ **1.57 MAC/cycle**, 스칼라 대비 17.45× · f32 64³ 1.04 MAC/cycle, 17.93× |
+| 모델 추론 | lenet5 560.7 ms · charrnn 3.15 s · vgg 81.5 s · yolo 약 736 s |
+| 모델 적재 | USB-UART 73.8 KB/s (JTAG의 57배) |
+| 검증 | DDR 체크섬, 보드 UART 출력 줄 체크섬, 디버거 대조, argmax 회귀 |
+
+## 저장소 구조
+
+이 저장소는 상류 코드를 복사해 두지 않는다. **고정된 상류 커밋 + `patches/`**만 들고 있고,
+`coral`이 둘을 합쳐 빌드·적재·실행까지 한다.
 
 ```
 config.sh       상류 커밋, 구성(CONFIG), hw_server 주소, UART 장치 — 버전 고정은 여기만
-patches/        상류에 얹는 패치. 번호 순서대로 적용
-coral           모든 작업의 입구 (아래)
-vivado/         비트스트림 다운로드 Tcl
-udev/           USB 권한 규칙
+patches/        상류에 얹는 패치 0001~0013. 번호 순서대로 적용, 적용된 것은 고치지 않는다
+coral           모든 작업의 입구
+tools/          모델 로더(ddr_run.py), 보드 도우미(ddr_stub.S, result_printer.S, rvasm.pl),
+                서버·VM 설치 스크립트, 야간 빌드, VM 메일박스 에이전트
+vivado/         비트스트림 다운로드, DDR4 IP 생성·검사 Tcl
+udev/           보드 USB 권한 규칙
+.github/        보드 CI (board-test)
 work/ out/ .tools/  (git 제외) 상류 체크아웃 / 산출물 / 내려받은 도구
 ```
 
-진행 기록과 측정값은 [docs/LOG.md](docs/LOG.md). **프로젝트 정리(성능, 한계, 운영, 올리는 법)는
-[docs/SUMMARY.md](docs/SUMMARY.md).** 2026-11-04 현재 보드는 연구실 서버 sota-AIP 에 있고
-GitHub Actions `board-test` 가 검증한다. 아래 "처음 한 번"의 fractal 구성은 이전 기록이다.
+## 지금의 구성
 
-## 보드를 연결한 뒤
-
-```bash
-./coral doctor     # 도구·케이블·시리얼 확인
-./coral up         # 비트스트림 다운로드 → ROM 배너 확인 → hello.elf 실행 → "CoralNPU is up."
+```
+[빌드 VM, Vivado 라이선스]  ./coral build  →  out/chip_vcu118_vector_highmem.bit, 테스트 ELF
+          │ scp (비트스트림·설정·ELF, SHA256SUMS)
+          ▼
+[sota-AIP, 보드 USB]        ./coral program  (Vivado Lab, 무료)
+                            ./coral model ~/models/<elf>   (OpenOCD + USB-UART)
+                            GitHub Actions board-test (self-hosted 러너 'vcu118')
 ```
 
-`up` 이 하는 일:
+- 빌드는 Vivado 라이선스가 VM(MAC 고정)에 묶여 있어 VM에서만 한다. 한 판에 9~13시간.
+- 보드 쪽은 라이선스가 필요 없다 (Vivado Lab 2026.1, OpenOCD 0.12).
 
-1. `out/chip_vcu118_<CONFIG>.bit` 을 Vivado 로 FPGA 에 올린다.
-2. USB-UART 에서 부트 ROM 배너를 기다린다:
-   `CoralNPU on VCU118: ROM alive, main clock 50 MHz`
-3. hw_server 를 내리고 OpenOCD 로 JTAG(BSCANE2) 에 붙어 `out/vcu118_hello.elf` 를
-   ITCM/DTCM 에 올리고 실행한다. UART 에 `Hello from CoralNPU ...` … `DONE`.
+## 보드에서 실행 (sota-AIP)
 
-빌드 중 VM 이 꺼지면 **다른 bazel/coral build 를 돌리기 전에** `./coral resume` — Bazel 샌드박스에
-남은 Vivado 체크포인트(opt/placed/physopt/routed)에서 이어서 비트스트림을 만든다. 이어서 `./coral sw`
-(hello.elf + OpenOCD 설정), `./coral up`.
+```bash
+cd ~/Coralnpu-vcu118
+CONFIG=vector_highmem ./coral program              # 비트스트림 (전원을 껐다 켠 뒤 한 번)
+./coral run out/vcu118_rvv_test_highmem.elf        # RVV 회귀 → "RVV PASS"
+./coral run out/vcu118_matmul_bench_highmem.elf    # 행렬 곱 → "MATMUL PASS"
+./coral model ~/models/lenet5                      # IREE 모델
+./coral model ~/models/yolo --timeout 2400         # 15분 넘게 도는 모델
+```
 
-내 프로그램을 돌릴 때는 `./coral load my_program.elf`, 콘솔만 볼 때는 `./coral console`.
+`coral model`이 하는 일 (자세히는 [SUMMARY.md §4](docs/SUMMARY.md)):
 
-DDR 에 올리는 IREE 모델 ELF 는 `./coral model <elf>` (vector_highmem 비트스트림).
-어떤 ELF 가 돌아가는지(명령어 셋, 메모리 배치, 결과 심볼)는 [docs/MODEL_ELF.md](docs/MODEL_ELF.md).
+1. JTAG로 ITCM에 적재 스텁(0x0)과 결과 출력 루틴(0x400)을 올린다.
+2. 스텁이 DDR4 보정 완료를 확인한다.
+3. DDR 세그먼트를 USB-UART(921600)로 보내고 체크섬을 맞춘다.
+4. 모델을 실행한다. 끝나면 보드가 결과를 UART로 직접 출력한다 (줄마다 체크섬).
+5. 호스트가 줄 체크섬을 검증하고, 디버거로 읽은 값과 대조한다.
+   결과 텍스트는 `out/results/<모델>-<시각>.uart.txt`.
+
+옵션: `--jtag` (UART 없이, 57배 느림), `--no-print` (보드 직접 출력 끄기).
+
+## CI
+
+GitHub → Actions → **board-test** → Run workflow (모델 선택, 기본 lenet5 charrnn vgg).
+매주 월 04:00 KST에 4종 전부 자동 실행. program → RVV → matmul → 모델 순서이고,
+모델마다 `_ret = 0`, 줄 체크섬, 디버거 대조, argmax(7/53/959/92)를 확인한다.
+PR로는 실행되지 않는다 (포크 코드가 연구실 서버에서 돌지 않게).
 
 ## 처음 한 번
 
-**현재 구성 (2026-10-13): 빌드는 VM, 실행은 fractal.**
-Vivado 라이선스는 공용 서버에 묶지 않고 VM(MAC 고정)에 발급한다. 비트스트림 다운로드·디버그·콘솔은
-라이선스가 필요 없으므로 보드 USB 가 꽂힌 fractal 에서 한다.
-
-```
-[VM vcu118-dev]  ./coral build  →  out/*.bit, out/vcu118_hello.elf
-      │  ./coral deploy up   (scp + ssh, sota.pusan.ac.kr:10022)
-      ▼
-[fractal]        ./coral up  (hw_server, OpenOCD, UART — 로컬 USB)
-```
-
+### 보드 서버 (라이선스 불필요)
 ```bash
-# 양쪽 공통 (VM 과 fractal 각각)
 git clone https://github.com/SOTA-PNU/Coralnpu-vcu118.git && cd Coralnpu-vcu118
-./tools/setup-host.sh        # 멈춘 곳의 안내를 따르고 다시 실행
-# VM 에서만
-./tools/setup-host.sh license ~/Downloads/Xilinx.lic
-./coral build
-./coral deploy up            # fractal 로 복사하고 거기서 coral up 실행
+./tools/setup-board-host.sh      # 멈춘 곳의 안내를 따르고 다시 실행
 ```
+패키지(openocd, picocom), udev 규칙, Vivado Lab 2026.1(설치 파일을 `~/Downloads`에),
+Digilent 케이블 드라이버, `en_US.UTF-8` 로캘을 확인·설치한다. sudo가 필요하다.
+그 다음 빌드 VM에서 비트스트림·`openocd_vcu118.cfg`·테스트 ELF를 `out/`에, 모델 ELF를 `~/models/`에 복사한다.
 
-`setup-host.sh` 가 하는 일: 패키지(openocd, picocom 포함), libtinfo.so.5 (24.04 는 .so.6 로 링크),
-VCU118 USB udev 규칙, Vivado 2026.1 설치(ML Enterprise, Virtex UltraScale+ 만),
-Digilent 케이블 드라이버, 라이선스 안내(이 호스트의 MAC), `coral setup`.
-서버에 모니터가 없으면 Vivado 설치 파일은 내 PC 브라우저에서 받아 `scp` 로 `~/Downloads` 에 넣는다.
+### 빌드 머신 (라이선스 필요)
+```bash
+./tools/setup-host.sh                             # 패키지, Vivado 2026.1(Virtex UltraScale+), 드라이버
+./tools/setup-host.sh license ~/Downloads/Xilinx.lic
+CONFIG=vector_highmem ./coral build
+```
+합성에 RAM+swap 약 40 GB가 필요하다. 빌드 중 VM이 꺼지면 다른 빌드를 돌리기 전에
+`./coral resume`으로 Vivado 체크포인트에서 이어 간다.
+Windows에 VM을 만들 때는 `tools/create-vcu118-vm.ps1` (MAC 고정).
 
-공용 서버이므로 `coral` 은 **내 hw_server 만** 종료한다. 다른 사용자의 hw_server 가 JTAG 을
-잡고 있으면 멈추고 알려 준다.
+### 구성
 
-`CONFIG=<구성> ./coral build` 로 다른 판을 만든다. 모두 50 MHz.
+`CONFIG=<구성> ./coral build`. 모두 50 MHz.
 
-| CONFIG | 유닛 | ITCM / DTCM |
-|---|---|---|
-| `vector_normal` (기본) | 스칼라 + RVV | 8 KB / 32 KB |
-| `vector_highmem` | 스칼라 + RVV | 1 MB / 1 MB |
-| `matrix_normal` | 스칼라 + RVV + 매트릭스(VME/ZVT) | 8 KB / 32 KB |
-| `matrix_highmem` | 스칼라 + RVV + 매트릭스(VME/ZVT) | 1 MB / 1 MB |
-
-상류 Nexus 는 매트릭스 판을 30 MHz 로 돌린다. VCU118 은 50 MHz 로 시도하므로
-`out/reports_<CONFIG>/` 의 타이밍 리포트에서 WNS ≥ 0 인지 먼저 확인할 것.
-DDR 이 아직 없으므로 큰 프로그램은 highmem 판.
-
-합성에 RAM+스왑 약 40 GB 가 필요하다 (20 GB + 2 GB 에서 OOM 으로 죽음).
-
-### 다른 구성 (보조)
-
-| 스크립트 | 언제 |
-|---|---|
-| `tools/create-vcu118-vm.ps1` | 리눅스 서버가 없을 때 Windows 에 Ubuntu 22.04 VM 을 만든다 (MAC 고정) |
-| `tools/board-host.ps1` | 보드가 Windows PC 에 꽂혀 있을 때: hw_server + COM→TCP 중계 |
+| CONFIG | 유닛 | ITCM / DTCM | 상태 |
+|---|---|---|---|
+| `vector_normal` (기본) | 스칼라 + RVV | 8 KB / 32 KB | 보드 확인 (DDR 없음) |
+| `vector_highmem` | 스칼라 + RVV | 1 MB / 1 MB | **사용 중** (DDR4 포함) |
+| `matrix_normal` | + 매트릭스(VME/ZVT) | 8 KB / 32 KB | VU9P에 안 들어감 |
+| `matrix_highmem` | + 매트릭스(VME/ZVT) | 1 MB / 1 MB | VU9P에 안 들어감 |
 
 ## 보드 연결
 
 | 커넥터 | 장치 | 용도 |
 |---|---|---|
 | J106 (micro-B) | Digilent JTAG-SMT2-NC, USB `0403:6014` | 비트스트림, 디버그(OpenOCD) |
-| J4 | Silicon Labs CP2105, USB `10c4:ea70` | 콘솔 115200 8N1 (포트 2개 중 배너가 나오는 쪽) |
+| J4 | Silicon Labs CP2105, USB `10c4:ea70` | UART1: 콘솔 115200, 모델 적재·결과 921600. FPGA 쪽은 `if01` |
 | J15 | 12V 전원 | **PC ATX 6핀 금지** (핀 배치 다름) |
 
-LED: `0` 클럭 lock · `1` 하트비트 · `2` halted · `3` fault · `7:4` ROM 이 돌리는 패턴.
+LAN은 쓰지 않는다 (베어메탈, 호스트가 USB로 모든 일을 한다).
+LED: `0` 클럭 lock · `1` 하트비트 · `2` halted · `3` fault · `5` DDR4 ui_clk · `6` DDR4 리셋 해제 · `7` DDR4 보정 완료.
 
-### 보드가 다른 PC 에 꽂혀 있을 때
+## 바꾸고 올리는 법
 
-빌드 머신과 보드 PC 가 다르면 비트스트림은 `HW_SERVER=<보드PC>:3121 ./coral program` 으로
-올릴 수 있지만, `load`/`up` 은 OpenOCD 가 USB-JTAG 을 직접 잡아야 하므로 보드가 꽂힌 머신에서
-실행해야 한다.
+자세히는 [SUMMARY.md §7](docs/SUMMARY.md). 핵심만:
 
-## 패치 추가하는 법
+- **이미 적용된 `patches/*.patch`는 고치지 않는다.** `coral`이 "changed since it was applied"로
+  모든 빌드를 멈춘다. RTL·빌드 변경은 새 번호 패치로:
+  ```bash
+  ./coral setup && cd work/coralnpu
+  # ... 수정 ...
+  git add -A && git commit -m "fpga/vcu118: 설명"
+  git format-patch -1 -o ../../patches --start-number 14
+  ```
+- `tools/`, `vivado/`, `coral`, 문서는 바로 고쳐 커밋한다.
+- `tools/ddr_stub.S`·`tools/result_printer.S`를 고치면 `perl tools/rvasm.pl`로 다시 어셈블해
+  `ddr_run.py`의 워드를 바꾸고 `perl tools/rvasm.pl --check`로 확인한다.
+- `git push origin main` 후 서버는 `git pull --ff-only`, 그리고 Actions에서 board-test.
 
-```bash
-cd work/coralnpu
-# ... 수정 ...
-git add -A && git commit -m "fpga: 설명"
-git format-patch -1 -o ../../patches --start-number <다음 번호>
-```
+## 패치
 
-`./coral setup` 은 이미 적용된 패치를 건너뛰므로 몇 번을 다시 돌려도 된다. 상류 커밋을
-올리려면 `config.sh` 의 `CORALNPU_COMMIT` 을 바꾸고 `work/` 를 지운 뒤 `setup`.
-
-## 현재 패치
-
-`0002-vcu118-matrix-50mhz.patch` — 매트릭스 판 VCU118 타깃, ZVT 플래그 전달, 전 구성 50 MHz.
-
-`0001-vcu118-port.patch` — `fpga/` 에 VCU118 탑(`chip_vcu118`), 125 MHz 클럭 생성기,
-BSCANE2 디버그 전송, 핀 XDC(AMD 보드 파일과 대조 완료), Vivado 훅(VU9P 는 SLR0~2),
-부트 ROM(`rom_park.c`), `hello.c`, OpenOCD 설정 생성기. 자세한 설명은 적용 후
-`work/coralnpu/fpga/vcu118/README.md`.
+| 번호 | 내용 |
+|---|---|
+| 0001 | VCU118 탑(`chip_vcu118`), 클럭, BSCANE2 디버그, 핀 XDC, 부트 ROM, hello, OpenOCD 설정 생성기 |
+| 0002 | 매트릭스(VME/ZVT) 판 타깃, 전 구성 50 MHz |
+| 0003 | OpenOCD 0.11 호환 (`set_mem_access` 없음) |
+| 0004 | autoboot 리셋 net 선언 순서 (상류 결함) |
+| 0005 | RVV 스모크 테스트 (vadd, vmacc, vredsum, vfmacc) |
+| 0006 | ISP 제거, int8/f32 행렬 곱 벤치마크 |
+| 0007 | 매트릭스 유닛 스모크 테스트 |
+| 0008 | 테스트 프로그램 highmem 판, int8 128³ |
+| 0009 | DDR4 C1 연결 (0x8000_0000, AXI 256→512, 비동기 클럭 변환) |
+| 0010 | DDR4 보정 펌웨어를 비트스트림에 삽입 |
+| 0011 | DDR4 bring-up 가시성 (LED, GPIO, MIG 디버그 허브) |
+| 0012 | DDR4 파워온 리셋 카운터 |
+| 0013 | DDR4 입력 클럭: `TimePeriod 1000` 요청 삭제 (VCO 4250 → 1500 MHz) |
 
 ## 알려진 한계
 
-- **DDR4 는 vector_highmem 판에만 있다** (`patches/0009`~`0013`). vector_normal 판에서 `0x8000_0000` 이상 접근 시 버스가 멈춘다 → CPU_RESET 버튼.
-- 보드 검증 완료 (50 MHz): 부팅, JTAG 적재, UART, RVV, 행렬곱, DDR4 보정, IREE 모델 4개 실행.
-- **matrix_* 판은 VU9P 에 들어가지 않는다.** LUT 87%, CLB 99% 로 배선에 실패한다. 상류는 VU13P 를 쓴다. 자세한 내용은 docs/LOG.md [10/21].
-- OpenOCD 의 IR 코드는 Vivado 의 BSDL 에서 읽는다(`gen_openocd_cfg.sh`). 첫 실행 때
-  `out/openocd_vcu118.cfg` 의 값을 확인해 둘 것.
+- 모델 출력의 정답 판정은 아직 없다 (argmax는 회귀 기준).
+- 매트릭스 판은 VU9P에 들어가지 않는다 (LUT 87 %, CLB 99 %). VU13P급 필요.
+- IREE 모델은 하드웨어 여력(1.57 MAC/cycle)의 5 % 이하만 쓴다 — 병목은 IREE 코드 생성·런타임 ([BENCHMARK.md](docs/BENCHMARK.md)).
+- `cyc_*` 카운터는 32비트라 86초가 넘는 실행은 넘친다.
+- 압축 명령어(C)·double(D) 없음. 모델 ELF는 ITCM 세그먼트가 없어야 한다 ([MODEL_ELF.md](docs/MODEL_ELF.md)).
+- 빌드는 라이선스 VM에서만, 9~13시간. CI에는 빌드가 없다.
+- 전체 목록은 [SUMMARY.md §5](docs/SUMMARY.md).

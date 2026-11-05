@@ -13,8 +13,9 @@
 #   ./coral up [x.bit]        program + wait for the ROM banner + run hello.elf
 #   ./coral deploy [up]       copy out/ to the board host (fractal); "up" also runs
 #                             "coral up" there (build in the licensed VM, run on fractal)
-#   ./coral model <x.elf>     run a DDR-resident program (IREE model ELF) over JTAG
-#                             and print its inference_* results (DDR4 bitstream)
+#   ./coral model <x.elf>     run a DDR-resident program (IREE model ELF): load over the
+#                             USB-UART (JTAG fallback), board prints its results
+#                             (DDR4 bitstream; see tools/ddr_run.py, docs/MODEL_ELF.md)
 #   ./coral ddr4-fw           add the DDR4 calibration firmware to an existing
 #                             bitstream (builds before patch 0010), ~15 min
 #   ./coral ddr4-probe [synth] generate the DDR4 C1 controller IP only (minutes) and
