@@ -15,7 +15,9 @@ udev/           USB 권한 규칙
 work/ out/ .tools/  (git 제외) 상류 체크아웃 / 산출물 / 내려받은 도구
 ```
 
-진행 기록과 측정값은 [docs/LOG.md](docs/LOG.md).
+진행 기록과 측정값은 [docs/LOG.md](docs/LOG.md). **프로젝트 정리(성능, 한계, 운영, 올리는 법)는
+[docs/SUMMARY.md](docs/SUMMARY.md).** 2026-11-04 현재 보드는 연구실 서버 sota-AIP 에 있고
+GitHub Actions `board-test` 가 검증한다. 아래 "처음 한 번"의 fractal 구성은 이전 기록이다.
 
 ## 보드를 연결한 뒤
 
