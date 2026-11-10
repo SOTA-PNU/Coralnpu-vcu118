@@ -42,9 +42,11 @@ COCO = (
     "banana apple sandwich orange broccoli carrot hot_dog pizza donut cake chair couch potted_plant "
     "bed dining_table toilet tv laptop mouse remote keyboard cell_phone microwave oven toaster sink "
     "refrigerator book clock vase scissors teddy_bear hair_drier toothbrush").split()
-# YOLOv3-tiny: 13x13 head uses anchors 3,4,5; 26x26 head uses 1,2,3 (416 input)
+# YOLOv3-tiny: 13x13 head uses anchors 3,4,5; 26x26 head uses 0,1,2 (416 input).
+# (darknet cfg says 1,2,3 for the second head; this model matches 0,1,2: with 1,2,3
+# the small person at the right edge decodes too big and NMS removes it.)
 ANCHORS = [(10, 14), (23, 27), (37, 58), (81, 82), (135, 169), (344, 319)]
-HEADS = {13: (3, 4, 5), 26: (1, 2, 3)}
+HEADS = {13: (3, 4, 5), 26: (0, 1, 2)}
 BOX_COLORS = [(255, 64, 64), (64, 255, 64), (64, 160, 255), (255, 220, 0), (255, 0, 255),
               (0, 255, 255)]
 
@@ -276,9 +278,9 @@ def main():
         md += ["| # | 클래스 | score | 박스 (x0,y0)-(x1,y1) |", "|---|---|---|---|"]
         for n, b in enumerate(boxes[:20], 1):
             lab = COCO[b[1]] if b[1] < len(COCO) else "#%d" % b[1]
-            p("  %2d  %-14s %.3f  %s  (%4d,%4d)-(%4d,%4d)"
+            p("  %2d  %-14s %.4f  %s  (%4d,%4d)-(%4d,%4d)"
               % (n, lab, b[0], bar(b[0], 20), b[2], b[3], b[4], b[5]))
-            md.append("| %d | %s | %.3f | (%d,%d)-(%d,%d) |" % (n, lab, b[0], *b[2:]))
+            md.append("| %d | %s | %.4f | (%d,%d)-(%d,%d) |" % (n, lab, b[0], *b[2:]))
         if not boxes:
             md.append("| - | (없음) | | |")
     elif len(ins) == 3 and len(sizes) == 3:  # CharRNN: tokens, h, c -> logits, h, c
@@ -291,7 +293,7 @@ def main():
         md.append("")
         md += topk_md(rows)
         for r in rows:
-            p("  %d. #%-3d  logit %7.3f  p %.3f  %s" % (r[0], r[1], r[3], r[4], bar(r[4])))
+            p("  %d. #%-3d  logit %8.4f  p %.4f  %s" % (r[0], r[1], r[3], r[4], bar(r[4])))
         p("  h: min %.3f max %.3f   c: min %.3f max %.3f"
           % (outs[1].min(), outs[1].max(), outs[2].min(), outs[2].max()))
     else:
@@ -309,7 +311,7 @@ def main():
         rows = topk_lines(outs[0], labels)
         p("\n  top-5 (%s)" % tag)
         for r in rows:
-            p("  %d. %-14s logit %7.3f  p %.3f  %s" % (r[0], r[2], r[3], r[4], bar(r[4])))
+            p("  %d. %-14s logit %8.4f  p %.4f  %s" % (r[0], r[2], r[3], r[4], bar(r[4])))
         p("\n  결과: %s (#%d, p %.3f)" % (term.bold(rows[0][2]), rows[0][1], rows[0][4]))
         md += topk_md(rows)
     p("== end %s ==" % name)
@@ -322,7 +324,7 @@ def main():
 def topk_md(rows):
     md = ["| 순위 | 클래스 | logit | 확률 |", "|---|---|---|---|"]
     for r in rows:
-        md.append("| %d | %s (#%d) | %.3f | %.3f |" % (r[0], r[2], r[1], r[3], r[4]))
+        md.append("| %d | %s (#%d) | %.4f | %.4f |" % (r[0], r[2], r[1], r[3], r[4]))
     return md
 
 
