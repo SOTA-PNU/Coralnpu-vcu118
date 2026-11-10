@@ -47,6 +47,11 @@ COCO = (
 # the small person at the right edge decodes too big and NMS removes it.)
 ANCHORS = [(10, 14), (23, 27), (37, 58), (81, 82), (135, 169), (344, 319)]
 HEADS = {13: (3, 4, 5), 26: (0, 1, 2)}
+# CharRNN (SOTA-PNU/Coral-API lowering/models/_data.py char_vocab(64)): the 64 most
+# frequent characters of /usr/share/common-licenses/{GPL-3,Apache-2.0,BSD}, sorted.
+# Rebuilt on sota-AIP (Ubuntu 24.04) 11/10: decodes that pipeline's test input as
+# 'ying Verbatim Co', the same text its own report prints.
+CHARRNN_VOCAB = "\n \"'(),-./0123:;<ABCDEFGHILMNOPRSTUVWYabcdefghijklmnopqrstuvwxyz"
 BOX_COLORS = [(255, 64, 64), (64, 255, 64), (64, 160, 255), (255, 220, 0), (255, 0, 255),
               (0, 255, 255)]
 
@@ -285,15 +290,23 @@ def main():
             md.append("| - | (없음) | | |")
     elif len(ins) == 3 and len(sizes) == 3:  # CharRNN: tokens, h, c -> logits, h, c
         toks = np.frombuffer(ins[0][0], "<i8") if ins[0][0] else []
+        vocab = CHARRNN_VOCAB if sizes[0] == len(CHARRNN_VOCAB) else None
         p("\n  입력 문자 번호 %d개: %s" % (len(toks), " ".join(str(int(t)) for t in toks)))
-        p("  (모델 ELF에 vocab 표가 없어 문자 번호로 표시)")
-        rows = topk_lines(outs[0], None)
+        text = ""
+        if vocab:
+            text = "".join(vocab[t] if 0 <= t < len(vocab) else "?" for t in toks)
+            p("  텍스트 = %r   (vocab: Coral-API lowering/models/_data.py char_vocab)" % text)
+        labels = [repr(ch) for ch in vocab] if vocab else None
+        rows = topk_lines(outs[0], labels)
         p("\n  다음 문자 top-5 (vocab %d)" % sizes[0])
         md.append("입력 문자 번호: `%s`" % " ".join(str(int(t)) for t in toks))
+        if vocab:
+            md.append(" · 텍스트 `%r` → 다음 문자 **%s**" % (text, rows[0][2]))
         md.append("")
         md += topk_md(rows)
         for r in rows:
-            p("  %d. #%-3d  logit %8.4f  p %.4f  %s" % (r[0], r[1], r[3], r[4], bar(r[4])))
+            p("  %d. %-5s #%-3d  logit %8.4f  p %.4f  %s"
+              % (r[0], r[2], r[1], r[3], r[4], bar(r[4])))
         p("  h: min %.3f max %.3f   c: min %.3f max %.3f"
           % (outs[1].min(), outs[1].max(), outs[2].min(), outs[2].max()))
     else:

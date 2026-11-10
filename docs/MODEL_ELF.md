@@ -77,7 +77,7 @@ ELF 의 입력(`model_input*_data`, `_shape`)과 보드 출력(`inference_output
 | lenet5 | 1×1×28×28 f32 | 10 → MNIST 숫자 | **7** (logit 14.27) | 손글씨 7 ✅ |
 | vgg | 1×3×32×32 f32 (정규화) | 100 → CIFAR-100 | **tulip** (logit 19.57, 2위 poppy 7.22) | 튤립 ✅ |
 | yolo | 1×3×416×416 f32 (레터박스) | 13×13·26×26×255 → YOLOv3-tiny, COCO | **person** 0.962 / 0.835 / 0.759 / 0.499, **bus** 0.544 | 버스 앞 사람들 ✅ |
-| charrnn | 16 × i64 문자 번호 + h, c (128) | 64 logits + h + c | 다음 문자 #53 (p 0.97) | vocab 표가 없어 판정 불가 |
+| charrnn | 16 × i64 문자 번호 + h, c (128) | 64 logits + h + c | 'ying Verbatim Co' → **'p'** (#53, p 0.97) | Coral-API 참조와 같음 ✅ |
 
 - yolo 의 argmax 959 는 펼친 출력 텐서의 위치일 뿐 클래스가 아니다. 검출은 앵커 디코딩 + NMS 로 본다.
 - YOLO 출력 배치는 NCHW (채널 = 앵커×85 + 필드), 26×26 머리의 앵커는 0,1,2.
@@ -87,3 +87,5 @@ ELF 의 입력(`model_input*_data`, `_shape`)과 보드 출력(`inference_output
   (보드 0.499 = 그쪽 참조 49.9 %, 그쪽 에뮬레이터 47.0 %; ELF 빌드가 달라 생기는 재양자화 차이).
   사이클은 에뮬레이터가 보드보다 9.5~15배 적다 (에뮬레이터에는 DDR 지연이 없다).
 - 라벨 표는 ELF 에 없다. 출력 크기로 고르며, 다른 데이터셋으로 학습한 모델이면 라벨이 틀린다.
+- 이 ELF 들은 SOTA-PNU/Coral-API 의 `lowering/coral.sh` 가 만든다. charrnn 문자표는 그쪽
+  `lowering/models/_data.py` 의 `char_vocab(64)` (라이선스 문서 3개의 빈도 상위 64자, 정렬)를 서버에서 재현했다.
