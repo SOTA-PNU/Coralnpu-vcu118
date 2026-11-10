@@ -237,7 +237,9 @@ def main():
     ap.add_argument("--uart", required=True)
     ap.add_argument("--color", choices=("auto", "always", "never"), default="auto")
     ap.add_argument("--summary", help="append a markdown section (e.g. $GITHUB_STEP_SUMMARY)")
-    ap.add_argument("--png", help="also write the input image (with boxes) as PNG")
+    ap.add_argument("--wall", type=int,
+                    help="wall time of the run in s (ddr_run.py passes it; corrects cyc_invoke wraps)")
+    ap.add_argument("--png",help="also write the input image (with boxes) as PNG")
     a = ap.parse_args()
 
     color = a.color == "always" or (a.color == "auto" and (
@@ -259,10 +261,17 @@ def main():
     p = print
     md = ["### %s" % name, ""]
     p(term.bold("== %s ==" % name))
-    p("  _ret %s   추론 %d cycles = %.1f ms @ 50 MHz   출력 %s"
-      % (ret, cyc, cyc / 50e3, " + ".join(str(n) for n in sizes)))
-    md.append("`_ret` %s · 추론 **%.1f ms** (%d cycles @ 50 MHz) · 출력 %s"
-              % (ret, cyc / 50e3, cyc, " + ".join(str(n) for n in sizes)))
+    # cyc_invoke is 32-bit: at 50 MHz it wraps every 85.9 s. The number of wraps
+    # cannot be recovered (the wall time has 1 s steps and includes setup, and
+    # cyc_setup does not match the wall time), so long runs show the wall time.
+    # One more wrap would not fit in the wall time (+1 s step) -> the count is exact.
+    if a.wall is not None and cyc / 50e6 + 2 ** 32 / 50e6 <= a.wall + 1:
+        when = ("벽시계 %d s (setup 포함; cyc_invoke 는 32비트라 85.9 s 마다 넘쳐 하위 32비트만 남음)"
+                % a.wall)
+    else:
+        when = "%.1f ms (%d cycles @ 50 MHz)" % (cyc / 50e3, cyc)
+    p("  _ret %s   추론 %s   출력 %s" % (ret, when, " + ".join(str(n) for n in sizes)))
+    md.append("`_ret` %s · 추론 **%s** · 출력 %s" % (ret, when, " + ".join(str(n) for n in sizes)))
     md.append("")
 
     img = None

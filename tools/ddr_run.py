@@ -583,8 +583,12 @@ def main():
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     res = {}
     log = []
+    run_s = None  # wall time of the run itself (cyc_invoke wraps every 85.9 s)
     for line in proc.stdout:
         log.append(line)
+        m = re.match(r"DDRLOAD: finished \S+ after (\d+) s", line)
+        if m:
+            run_s = int(m.group(1))
         if line.startswith("DDRLOAD:"):
             print("    %6.1fs %s" % (time.time() - t0, line.rstrip()), flush=True)
             if reader is not None and line.startswith("DDRLOAD: start"):
@@ -633,6 +637,8 @@ def main():
                 cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                     "render_result.py"),
                        "--elf", a.elf, "--uart", outf, "--png", outf[:-len(".uart.txt")] + ".png"]
+                if run_s is not None:
+                    cmd += ["--wall", str(run_s)]
                 if os.environ.get("GITHUB_STEP_SUMMARY"):
                     cmd += ["--summary", os.environ["GITHUB_STEP_SUMMARY"]]
                 print()
