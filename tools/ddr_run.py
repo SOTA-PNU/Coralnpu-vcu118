@@ -547,6 +547,8 @@ def main():
     ap.add_argument("--jtag", action="store_true", help="load over JTAG even if --uart is given")
     ap.add_argument("--no-print", action="store_true",
                     help="do not patch crt0 to make the board print its results on the UART")
+    ap.add_argument("--no-render", action="store_true",
+                    help="skip render_result.py (input image, top-5 / detections)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--keep", action="store_true", help="keep the temp directory")
     a = ap.parse_args()
@@ -626,6 +628,17 @@ def main():
             print("==> board line sums: %s (%d acks sent, %d resyncs = blocks with lost bytes)" % (
                 "%d/%d ok" % (len(sums), len(sums)) if not bad else "BAD in " + ", ".join(bad),
                 reader.acks, reader.resyncs))
+            if not bad and not a.no_render:
+                # Input image, top-5 / detections. Display only: never fails the run.
+                cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                    "render_result.py"),
+                       "--elf", a.elf, "--uart", outf, "--png", outf[:-len(".uart.txt")] + ".png"]
+                if os.environ.get("GITHUB_STEP_SUMMARY"):
+                    cmd += ["--summary", os.environ["GITHUB_STEP_SUMMARY"]]
+                print()
+                sys.stdout.flush()
+                if subprocess.call(cmd) != 0:
+                    print("==> (render_result.py failed; results above are unaffected)")
     if fd is not None:
         os.close(fd)
     logf = os.path.join(tmp, "openocd.log")

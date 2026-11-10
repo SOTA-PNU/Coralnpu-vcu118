@@ -74,14 +74,22 @@ CONFIG=vector_highmem ./coral program              # 비트스트림 (전원을 
 4. 모델을 실행한다. 끝나면 보드가 결과를 UART로 직접 출력한다 (줄마다 체크섬).
 5. 호스트가 줄 체크섬을 검증하고, 디버거로 읽은 값과 대조한다.
    결과 텍스트는 `out/results/<모델>-<시각>.uart.txt`.
+6. `tools/render_result.py`가 결과를 사람이 읽는 형태로 보여 준다: 입력 그림(터미널 색),
+   top-5 막대와 라벨(MNIST / CIFAR-100), YOLO 검출 박스(COCO), CharRNN 문자 번호.
+   입력은 모델 ELF의 `model_input*_data`, 출력은 보드가 보낸 `inference_output`이다.
+   박스를 그린 입력 그림은 `out/results/<모델>-<시각>.png`. 따로 돌릴 때:
+   `python3 tools/render_result.py --elf ~/models/yolo --uart out/results/yolo-....uart.txt`
 
-옵션: `--jtag` (UART 없이, 57배 느림), `--no-print` (보드 직접 출력 끄기).
+옵션: `--jtag` (UART 없이, 57배 느림), `--no-print` (보드 직접 출력 끄기),
+`--no-render` (6 생략).
 
 ## CI
 
 GitHub → Actions → **board-test** → Run workflow (모델 선택, 기본 lenet5 charrnn vgg).
 매주 월 04:00 KST에 4종 전부 자동 실행. program → RVV → matmul → 모델 순서이고,
 모델마다 `_ret = 0`, 줄 체크섬, 디버거 대조, argmax(7/53/959/92)를 확인한다.
+실행 로그에 입력 그림과 top-5·검출 결과가 색으로 나오고, 실행 요약(Summary)에 표가,
+아티팩트에 UART 결과와 박스 그림(PNG)이 남는다.
 PR로는 실행되지 않는다 (포크 코드가 연구실 서버에서 돌지 않게).
 
 ## 처음 한 번

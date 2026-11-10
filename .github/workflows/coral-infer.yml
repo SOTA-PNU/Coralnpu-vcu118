@@ -1,0 +1,94 @@
+name: coral-infer
+
+# Runs IREE models on the VCU118 (lab server sota-AIP) and shows what the board
+# computed: the input image, top-5 with labels, YOLO boxes (tools/render_result.py).
+# board-test is the regression check; this one is for looking at the answers.
+#
+#   Summary   : per-model table (top-5 / detections, time)
+#   Log       : "<model> result" step, input image in colour
+#   Artifacts : board UART output (.uart.txt) and the input image with boxes (.png)
+#
+# Self-hosted and manual only (no pull_request), like board-test.
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: "models, space separated (lenet5 ~1 min, charrnn ~1 min, vgg ~5 min, yolo ~16 min)"
+        type: string
+        default: "lenet5 charrnn vgg yolo"
+      program:
+        description: "load the bitstream first (only needed after a power cycle)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: vcu118-board
+  cancel-in-progress: false
+
+env:
+  CONFIG: vector_highmem
+  BOARD_OUT: /home/ehdgns/Coralnpu-vcu118/out
+  MODELS: /home/ehdgns/models
+
+jobs:
+  infer:
+    runs-on: [self-hosted, linux, vcu118]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: board files
+        run: |
+          set -eu
+          rm -rf out && ln -s "$BOARD_OUT" out
+          (cd "$MODELS" && sha256sum -c SHA256SUMS)
+          lsusb | grep -E "0403:6014|10c4:ea70"
+          touch .start
+
+      - name: program
+        if: inputs.program
+        run: ./coral program 2>&1 | tail -5
+
+      - name: inference
+        run: |
+          set -u
+          echo "## VCU118 CoralNPU 추론 결과" >> "$GITHUB_STEP_SUMMARY"
+          echo "보드 UART가 보낸 출력(줄마다 체크섬 확인)과 모델 ELF의 입력으로 그렸다." >> "$GITHUB_STEP_SUMMARY"
+          fail=0
+          for m in ${{ inputs.models }}; do
+            t=900; [ "$m" = yolo ] && t=2400; [ "$m" = vgg ] && t=1800
+            echo "::group::$m 실행 로그 (적재, 체크섬, 디버거 대조)"
+            ./coral model "$MODELS/$m" --timeout $t > "model_$m.log" 2>&1
+            rc=$?
+            sed "/== $m ==/,\$d" "model_$m.log" | grep -vE "^ +[0-9.]+s DDRLOAD: [0-9]+ / "
+            echo "::endgroup::"
+            # the rendered result, outside the group so it shows without a click
+            sed -n "/== $m ==/,/== end $m ==/p" "model_$m.log"
+            echo
+            if [ $rc -eq 0 ] && grep -qE "_ret +00000000" "model_$m.log" &&
+               grep -qE "board line sums: ([0-9]+)/\1 ok" "model_$m.log"; then
+              echo "PASS $m"
+            else
+              echo "::error::FAIL $m (see model_$m.log)"
+              echo "**$m 실패** (rc $rc), 로그는 아티팩트 model_$m.log" >> "$GITHUB_STEP_SUMMARY"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: collect
+        if: always()
+        run: |
+          mkdir -p infer
+          cp -f model_*.log infer/ 2>/dev/null || true
+          find out/results -newer .start \( -name '*.uart.txt' -o -name '*.png' \) -size -4M \
+            -exec cp {} infer/ \; 2>/dev/null || true
+          ls -la infer
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coral-infer-${{ github.run_number }}
+          path: infer/
+          retention-days: 30
