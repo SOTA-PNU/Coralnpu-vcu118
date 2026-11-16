@@ -1,0 +1,757 @@
+From 251b7bfe6744ba5c09f0e75b25366da423bca6f4 Mon Sep 17 00:00:00 2001
+From: Donghun Yu <ehdgns1083@pusan.ac.kr>
+Date: Mon, 16 Nov 2026 16:44:58 +0900
+Subject: [PATCH] fpga/vcu118: PCIe Gen3 x8 XDMA into DDR4 C1
+
+Host DMA into the on-board DDR4 through the edge connector, so a model can
+be loaded over PCIe instead of the 74 KB/s USB-UART.
+
+- pcie_xdma: Gen3 x8, AXI-MM DMA, 256-bit at 250 MHz, 1 H2C + 1 C2H.
+  Lanes and PERST# from the board interfaces (pci_express_x8, pcie_perstn).
+- pcie_axi_cdc: async 250 MHz -> 50 MHz main clock.
+- ddr_axi_xbar: 2:1 crossbar on the main clock (S00 SoC, S01 PCIe) in
+  front of ddr4_c1_axi_up, whose ID widens 4 -> 5. The 300 MHz side is
+  unchanged. Card address 0 = DDR offset 0 = SoC 0x8000_0000.
+- vcu118_pcie_ip.tcl writes the reference clock (IBUFDS_GTE4) and PERST#
+  PACKAGE_PINs from the board files into vcu118_pcie_pins.xdc.
+- GPIO input bit 4 = PCIe link up.
+- check_pin_assignments: pci_exp_* are placed by the XDMA GT LOCs.
+---
+ fpga/BUILD                     |   1 +
+ fpga/check_pin_assignments.tcl |   7 +
+ fpga/chip_vcu118.core          |   3 +-
+ fpga/rtl/chip_vcu118.sv        | 410 +++++++++++++++++++++++++++++----
+ fpga/vcu118_pcie_ip.tcl        | 192 +++++++++++++++
+ fpga/vcu118_setup_hooks.tcl    |   6 +
+ 6 files changed, 574 insertions(+), 45 deletions(-)
+ create mode 100644 fpga/vcu118_pcie_ip.tcl
+
+diff --git a/fpga/BUILD b/fpga/BUILD
+index c521cf7..9e9b838 100644
+--- a/fpga/BUILD
++++ b/fpga/BUILD
+@@ -1006,6 +1006,7 @@ coralnpu_v2_binary(
+ VCU118_VIVADO_HOOKS = [
+     "vcu118_setup_hooks.tcl",
+     "vcu118_ddr4_c1_ip.tcl",
++    "vcu118_pcie_ip.tcl",
+     "vcu118_ddr4_fw.tcl",
+     "vcu118_bitstream_pre_hooks.tcl",
+     "vcu118_bitstream_post_hooks.tcl",
+diff --git a/fpga/check_pin_assignments.tcl b/fpga/check_pin_assignments.tcl
+index 04e7a53..416d50c 100644
+--- a/fpga/check_pin_assignments.tcl
++++ b/fpga/check_pin_assignments.tcl
+@@ -29,6 +29,13 @@ if {[llength [get_files -quiet {*pins_ddr_stub.xdc}]] > 0} {
+     lappend ignore_patterns "*c0_sys_clk*"
+ }
+ 
++# PCIe lanes (patch 0014): the XDMA IP places them through its GT channel
++# LOCs (PCIE_BOARD_INTERFACE), so the ports carry no PACKAGE_PIN before placement.
++if {[llength [get_cells -quiet -hier -filter {REF_NAME == pcie_xdma}]] > 0} {
++    puts "INFO: PCIe XDMA detected. Ignoring pci_exp_* (placed by the IP GT LOCs)."
++    lappend ignore_patterns "pci_exp_*"
++}
++
+ set missing_pins {}
+ 
+ foreach port $all_ports {
+diff --git a/fpga/chip_vcu118.core b/fpga/chip_vcu118.core
+index 874e4ea..0b92915 100644
+--- a/fpga/chip_vcu118.core
++++ b/fpga/chip_vcu118.core
+@@ -13,7 +13,7 @@ CAPI=2:
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ name: "com.google.coralnpu:fpga:chip_vcu118:0.1"
+-description: "VCU118-specific top-level for CoralNPU (BSCANE2 debug, DDR4 C1)."
++description: "VCU118-specific top-level for CoralNPU (BSCANE2 debug, DDR4 C1, PCIe XDMA)."
+ 
+ filesets:
+   files_rtl:
+@@ -36,6 +36,7 @@ filesets:
+     files:
+       - vcu118_setup_hooks.tcl: { file_type: tclSource }
+       - vcu118_ddr4_c1_ip.tcl: { file_type: user, copyto: vcu118_ddr4_c1_ip.tcl }
++      - vcu118_pcie_ip.tcl: { file_type: user, copyto: vcu118_pcie_ip.tcl }
+       - vcu118_ddr4_fw.tcl: { file_type: user, copyto: vcu118_ddr4_fw.tcl }
+       - vcu118_bitstream_pre_hooks.tcl: { file_type: user, copyto: vcu118_bitstream_pre_hooks.tcl }
+       - vcu118_bitstream_post_hooks.tcl: { file_type: user, copyto: vcu118_bitstream_post_hooks.tcl }
+diff --git a/fpga/rtl/chip_vcu118.sv b/fpga/rtl/chip_vcu118.sv
+index c1e3a3a..189f9cf 100644
+--- a/fpga/rtl/chip_vcu118.sv
++++ b/fpga/rtl/chip_vcu118.sv
+@@ -43,6 +43,12 @@
+ //           [7] on when calibration is complete
+ //   * GPIO inputs: [0] calibration complete [1] controller out of reset
+ //                  [2] STARTUPE3 EOS   [3] DDR4 power-on reset still held
++//                  [4] PCIe link up
++//   * PCIe:  Gen3 x8 XDMA on the edge connector (patch 0014). The host DMAs
++//            into DDR4 C1: card address 0 = SoC 0x8000_0000. An AXI crossbar
++//            on the 50 MHz main clock shares the DDR path between the SoC
++//            (S00) and the XDMA (S01, through an async clock converter), in
++//            front of ddr4_c1_axi_up, so the 300 MHz side is unchanged.
+ module chip_vcu118 #(
+     parameter MemInitFile = "",
+     parameter int ClockFrequencyMhz = 50,
+@@ -77,7 +83,17 @@ module chip_vcu118 #(
+     inout  wire  [7:0]  c0_ddr4_dm_dbi_n,
+     inout  wire  [63:0] c0_ddr4_dq,
+     inout  wire  [7:0]  c0_ddr4_dqs_t,
+-    inout  wire  [7:0]  c0_ddr4_dqs_c
++    inout  wire  [7:0]  c0_ddr4_dqs_c,
++    // PCIe edge connector, Gen3 x8 (patch 0014). Lanes and PERST# are placed
++    // by the XDMA board interfaces, the reference clock by the XDC that
++    // vcu118_pcie_ip.tcl writes from the board files.
++    input  logic        pcie_refclk_p,  // 100 MHz from the host slot
++    input  logic        pcie_refclk_n,
++    input  logic        pcie_perst_n,
++    output logic [7:0]  pci_exp_txp,
++    output logic [7:0]  pci_exp_txn,
++    input  logic [7:0]  pci_exp_rxp,
++    input  logic [7:0]  pci_exp_rxn
+ );
+ 
+   // ------------------------------------------------------------------
+@@ -202,7 +218,6 @@ module chip_vcu118 #(
+   logic         m_rvalid, m_rready, m_rlast;
+   logic [255:0] m_wdata, m_rdata;
+   logic [31:0]  m_wstrb;
+-  logic [3:0]   up_bid, up_rid;
+ 
+   // Controller side, ui_clk (300 MHz)
+   logic [30:0]  c_awaddr, c_araddr;
+@@ -316,49 +331,356 @@ module chip_vcu118 #(
+       .c0_ddr4_s_axi_rdata    (c_rdata)
+   );
+ 
++  // ------------------------------------------------------------------
++  // PCIe (patch 0014): host -> XDMA (250 MHz) -> pcie_axi_cdc (50 MHz)
++  // -> ddr_axi_xbar S01. The SoC is S00. Card address 0 = DDR offset 0
++  // = SoC 0x8000_0000.
++  // ------------------------------------------------------------------
++  logic pcie_sys_clk, pcie_sys_clk_gt;
++  logic pcie_aclk, pcie_aresetn, pcie_lnk_up, pcie_lnk_up_sync;
++
++  IBUFDS_GTE4 #(
++      .REFCLK_HROW_CK_SEL(2'b00)  // ODIV2 = O / 1, as the XDMA example design
++  ) i_pcie_refclk_buf (
++      .I    (pcie_refclk_p),
++      .IB   (pcie_refclk_n),
++      .CEB  (1'b0),
++      .O    (pcie_sys_clk_gt),
++      .ODIV2(pcie_sys_clk)
++  );
++
++  // XDMA master, axi_aclk domain
++  logic [3:0]   p_awid, p_arid, p_bid, p_rid;
++  logic [63:0]  p_awaddr, p_araddr;
++  logic [7:0]   p_awlen, p_arlen;
++  logic [2:0]   p_awsize, p_arsize, p_awprot, p_arprot;
++  logic [1:0]   p_awburst, p_arburst, p_bresp, p_rresp;
++  logic         p_awlock, p_arlock;
++  logic [3:0]   p_awcache, p_arcache;
++  logic         p_awvalid, p_awready, p_wvalid, p_wready, p_wlast;
++  logic         p_bvalid, p_bready, p_arvalid, p_arready;
++  logic         p_rvalid, p_rready, p_rlast;
++  logic [255:0] p_wdata, p_rdata;
++  logic [31:0]  p_wstrb;
++
++  pcie_xdma i_pcie_xdma (
++      .sys_clk         (pcie_sys_clk),
++      .sys_clk_gt      (pcie_sys_clk_gt),
++      .sys_rst_n       (pcie_perst_n),
++      .user_lnk_up     (pcie_lnk_up),
++      .pci_exp_txp     (pci_exp_txp),
++      .pci_exp_txn     (pci_exp_txn),
++      .pci_exp_rxp     (pci_exp_rxp),
++      .pci_exp_rxn     (pci_exp_rxn),
++      .axi_aclk        (pcie_aclk),
++      .axi_aresetn     (pcie_aresetn),
++      .usr_irq_req     (1'b0),
++      .usr_irq_ack     (),
++      .msi_enable      (),
++      .msi_vector_width(),
++      .m_axi_awready   (p_awready),
++      .m_axi_wready    (p_wready),
++      .m_axi_bid       (p_bid),
++      .m_axi_bresp     (p_bresp),
++      .m_axi_bvalid    (p_bvalid),
++      .m_axi_arready   (p_arready),
++      .m_axi_rid       (p_rid),
++      .m_axi_rdata     (p_rdata),
++      .m_axi_rresp     (p_rresp),
++      .m_axi_rlast     (p_rlast),
++      .m_axi_rvalid    (p_rvalid),
++      .m_axi_awid      (p_awid),
++      .m_axi_awaddr    (p_awaddr),
++      .m_axi_awlen     (p_awlen),
++      .m_axi_awsize    (p_awsize),
++      .m_axi_awburst   (p_awburst),
++      .m_axi_awprot    (p_awprot),
++      .m_axi_awvalid   (p_awvalid),
++      .m_axi_awlock    (p_awlock),
++      .m_axi_awcache   (p_awcache),
++      .m_axi_wdata     (p_wdata),
++      .m_axi_wstrb     (p_wstrb),
++      .m_axi_wlast     (p_wlast),
++      .m_axi_wvalid    (p_wvalid),
++      .m_axi_bready    (p_bready),
++      .m_axi_arid      (p_arid),
++      .m_axi_araddr    (p_araddr),
++      .m_axi_arlen     (p_arlen),
++      .m_axi_arsize    (p_arsize),
++      .m_axi_arburst   (p_arburst),
++      .m_axi_arprot    (p_arprot),
++      .m_axi_arvalid   (p_arvalid),
++      .m_axi_arlock    (p_arlock),
++      .m_axi_arcache   (p_arcache),
++      .m_axi_rready    (p_rready)
++  );
++
++  // Link status into the main clock domain (GPIO input bit 4).
++  xpm_cdc_single #(
++      .DEST_SYNC_FF  (3),
++      .SRC_INPUT_REG (0)
++  ) i_pcie_lnk_sync (
++      .src_clk (1'b0),
++      .src_in  (pcie_lnk_up),
++      .dest_clk(clk),
++      .dest_out(pcie_lnk_up_sync)
++  );
++
++  // PCIe master after the clock converter, main clock
++  logic [3:0]   q_awid, q_arid, q_bid, q_rid;
++  logic [30:0]  q_awaddr, q_araddr;
++  logic [7:0]   q_awlen, q_arlen;
++  logic [2:0]   q_awsize, q_arsize, q_awprot, q_arprot;
++  logic [1:0]   q_awburst, q_arburst, q_bresp, q_rresp;
++  logic [0:0]   q_awlock, q_arlock;
++  logic [3:0]   q_awcache, q_arcache, q_awqos, q_arqos;
++  logic         q_awvalid, q_awready, q_wvalid, q_wready, q_wlast;
++  logic         q_bvalid, q_bready, q_arvalid, q_arready;
++  logic         q_rvalid, q_rready, q_rlast;
++  logic [255:0] q_wdata, q_rdata;
++  logic [31:0]  q_wstrb;
++
++  pcie_axi_cdc i_pcie_axi_cdc (
++      .s_axi_aclk    (pcie_aclk),
++      .s_axi_aresetn (pcie_aresetn),
++      .s_axi_awid    (p_awid),
++      .s_axi_awaddr  (p_awaddr[30:0]),
++      .s_axi_awlen   (p_awlen),
++      .s_axi_awsize  (p_awsize),
++      .s_axi_awburst (p_awburst),
++      .s_axi_awlock  (p_awlock),
++      .s_axi_awcache (p_awcache),
++      .s_axi_awprot  (p_awprot),
++      .s_axi_awregion(4'b0),
++      .s_axi_awqos   (4'b0),
++      .s_axi_awvalid (p_awvalid),
++      .s_axi_awready (p_awready),
++      .s_axi_wdata   (p_wdata),
++      .s_axi_wstrb   (p_wstrb),
++      .s_axi_wlast   (p_wlast),
++      .s_axi_wvalid  (p_wvalid),
++      .s_axi_wready  (p_wready),
++      .s_axi_bid     (p_bid),
++      .s_axi_bresp   (p_bresp),
++      .s_axi_bvalid  (p_bvalid),
++      .s_axi_bready  (p_bready),
++      .s_axi_arid    (p_arid),
++      .s_axi_araddr  (p_araddr[30:0]),
++      .s_axi_arlen   (p_arlen),
++      .s_axi_arsize  (p_arsize),
++      .s_axi_arburst (p_arburst),
++      .s_axi_arlock  (p_arlock),
++      .s_axi_arcache (p_arcache),
++      .s_axi_arprot  (p_arprot),
++      .s_axi_arregion(4'b0),
++      .s_axi_arqos   (4'b0),
++      .s_axi_arvalid (p_arvalid),
++      .s_axi_arready (p_arready),
++      .s_axi_rid     (p_rid),
++      .s_axi_rdata   (p_rdata),
++      .s_axi_rresp   (p_rresp),
++      .s_axi_rlast   (p_rlast),
++      .s_axi_rvalid  (p_rvalid),
++      .s_axi_rready  (p_rready),
++      .m_axi_aclk    (clk),
++      .m_axi_aresetn (rst_n),
++      .m_axi_awid    (q_awid),
++      .m_axi_awaddr  (q_awaddr),
++      .m_axi_awlen   (q_awlen),
++      .m_axi_awsize  (q_awsize),
++      .m_axi_awburst (q_awburst),
++      .m_axi_awlock  (q_awlock),
++      .m_axi_awcache (q_awcache),
++      .m_axi_awprot  (q_awprot),
++      .m_axi_awregion(),
++      .m_axi_awqos   (q_awqos),
++      .m_axi_awvalid (q_awvalid),
++      .m_axi_awready (q_awready),
++      .m_axi_wdata   (q_wdata),
++      .m_axi_wstrb   (q_wstrb),
++      .m_axi_wlast   (q_wlast),
++      .m_axi_wvalid  (q_wvalid),
++      .m_axi_wready  (q_wready),
++      .m_axi_bid     (q_bid),
++      .m_axi_bresp   (q_bresp),
++      .m_axi_bvalid  (q_bvalid),
++      .m_axi_bready  (q_bready),
++      .m_axi_arid    (q_arid),
++      .m_axi_araddr  (q_araddr),
++      .m_axi_arlen   (q_arlen),
++      .m_axi_arsize  (q_arsize),
++      .m_axi_arburst (q_arburst),
++      .m_axi_arlock  (q_arlock),
++      .m_axi_arcache (q_arcache),
++      .m_axi_arprot  (q_arprot),
++      .m_axi_arregion(),
++      .m_axi_arqos   (q_arqos),
++      .m_axi_arvalid (q_arvalid),
++      .m_axi_arready (q_arready),
++      .m_axi_rid     (q_rid),
++      .m_axi_rdata   (q_rdata),
++      .m_axi_rresp   (q_rresp),
++      .m_axi_rlast   (q_rlast),
++      .m_axi_rvalid  (q_rvalid),
++      .m_axi_rready  (q_rready)
++  );
++
++  // Crossbar: S00 = SoC (1-bit ID), S01 = PCIe (4-bit ID), M00 -> axi_up.
++  // Slot 0 is the low part of every concatenated vector.
++  logic [4:0]   x_awid, x_arid, x_bid, x_rid;
++  logic [30:0]  x_awaddr, x_araddr;
++  logic [7:0]   x_awlen, x_arlen;
++  logic [2:0]   x_awsize, x_arsize, x_awprot, x_arprot;
++  logic [1:0]   x_awburst, x_arburst, x_bresp, x_rresp;
++  logic [0:0]   x_awlock, x_arlock;
++  logic [3:0]   x_awcache, x_arcache, x_awqos, x_arqos, x_awregion, x_arregion;
++  logic         x_awvalid, x_awready, x_wvalid, x_wready, x_wlast;
++  logic         x_bvalid, x_bready, x_arvalid, x_arready;
++  logic         x_rvalid, x_rready, x_rlast;
++  logic [255:0] x_wdata, x_rdata;
++  logic [31:0]  x_wstrb;
++  logic [9:0]   s_bid, s_rid;
++  logic [1:0]   s_awready, s_wready, s_bvalid, s_arready, s_rvalid, s_rlast;
++  logic [3:0]   s_bresp, s_rresp;
++  logic [511:0] s_rdata;
++
++  ddr_axi_xbar i_ddr_axi_xbar (
++      .aclk          (clk),
++      .aresetn       (rst_n),
++      .s_axi_awid    ({1'b0, q_awid,    4'b0, m_awid}),
++      .s_axi_awaddr  ({q_awaddr,        m_awaddr[30:0]}),
++      .s_axi_awlen   ({q_awlen,         m_awlen}),
++      .s_axi_awsize  ({q_awsize,        m_awsize}),
++      .s_axi_awburst ({q_awburst,       m_awburst}),
++      .s_axi_awlock  ({q_awlock,        m_awlock}),
++      .s_axi_awcache ({q_awcache,       m_awcache}),
++      .s_axi_awprot  ({q_awprot,        m_awprot}),
++      .s_axi_awqos   ({q_awqos,         m_awqos}),
++      .s_axi_awvalid ({q_awvalid,       m_awvalid}),
++      .s_axi_awready (s_awready),
++      .s_axi_wdata   ({q_wdata,         m_wdata}),
++      .s_axi_wstrb   ({q_wstrb,         m_wstrb}),
++      .s_axi_wlast   ({q_wlast,         m_wlast}),
++      .s_axi_wvalid  ({q_wvalid,        m_wvalid}),
++      .s_axi_wready  (s_wready),
++      .s_axi_bid     (s_bid),
++      .s_axi_bresp   (s_bresp),
++      .s_axi_bvalid  (s_bvalid),
++      .s_axi_bready  ({q_bready,        m_bready}),
++      .s_axi_arid    ({1'b0, q_arid,    4'b0, m_arid}),
++      .s_axi_araddr  ({q_araddr,        m_araddr[30:0]}),
++      .s_axi_arlen   ({q_arlen,         m_arlen}),
++      .s_axi_arsize  ({q_arsize,        m_arsize}),
++      .s_axi_arburst ({q_arburst,       m_arburst}),
++      .s_axi_arlock  ({q_arlock,        m_arlock}),
++      .s_axi_arcache ({q_arcache,       m_arcache}),
++      .s_axi_arprot  ({q_arprot,        m_arprot}),
++      .s_axi_arqos   ({q_arqos,         m_arqos}),
++      .s_axi_arvalid ({q_arvalid,       m_arvalid}),
++      .s_axi_arready (s_arready),
++      .s_axi_rid     (s_rid),
++      .s_axi_rdata   (s_rdata),
++      .s_axi_rresp   (s_rresp),
++      .s_axi_rlast   (s_rlast),
++      .s_axi_rvalid  (s_rvalid),
++      .s_axi_rready  ({q_rready,        m_rready}),
++      .m_axi_awid    (x_awid),
++      .m_axi_awaddr  (x_awaddr),
++      .m_axi_awlen   (x_awlen),
++      .m_axi_awsize  (x_awsize),
++      .m_axi_awburst (x_awburst),
++      .m_axi_awlock  (x_awlock),
++      .m_axi_awcache (x_awcache),
++      .m_axi_awprot  (x_awprot),
++      .m_axi_awregion(x_awregion),
++      .m_axi_awqos   (x_awqos),
++      .m_axi_awvalid (x_awvalid),
++      .m_axi_awready (x_awready),
++      .m_axi_wdata   (x_wdata),
++      .m_axi_wstrb   (x_wstrb),
++      .m_axi_wlast   (x_wlast),
++      .m_axi_wvalid  (x_wvalid),
++      .m_axi_wready  (x_wready),
++      .m_axi_bid     (x_bid),
++      .m_axi_bresp   (x_bresp),
++      .m_axi_bvalid  (x_bvalid),
++      .m_axi_bready  (x_bready),
++      .m_axi_arid    (x_arid),
++      .m_axi_araddr  (x_araddr),
++      .m_axi_arlen   (x_arlen),
++      .m_axi_arsize  (x_arsize),
++      .m_axi_arburst (x_arburst),
++      .m_axi_arlock  (x_arlock),
++      .m_axi_arcache (x_arcache),
++      .m_axi_arprot  (x_arprot),
++      .m_axi_arregion(x_arregion),
++      .m_axi_arqos   (x_arqos),
++      .m_axi_arvalid (x_arvalid),
++      .m_axi_arready (x_arready),
++      .m_axi_rid     (x_rid),
++      .m_axi_rdata   (x_rdata),
++      .m_axi_rresp   (x_rresp),
++      .m_axi_rlast   (x_rlast),
++      .m_axi_rvalid  (x_rvalid),
++      .m_axi_rready  (x_rready)
++  );
++
++  // Slot 0 back to the SoC, slot 1 back to the PCIe converter.
++  assign {q_awready, m_awready} = s_awready;
++  assign {q_wready,  m_wready}  = s_wready;
++  assign {q_bvalid,  m_bvalid}  = s_bvalid;
++  assign {q_bresp,   m_bresp}   = s_bresp;
++  assign q_bid                  = s_bid[8:5];
++  assign {q_arready, m_arready} = s_arready;
++  assign {q_rvalid,  m_rvalid}  = s_rvalid;
++  assign {q_rlast,   m_rlast}   = s_rlast;
++  assign {q_rresp,   m_rresp}   = s_rresp;
++  assign {q_rdata,   m_rdata}   = s_rdata;
++  assign q_rid                  = s_rid[8:5];
++
+   // 0x8000_0000.. -> controller address 0 (2 GB window, bit 31 dropped).
+   ddr4_c1_axi_up i_ddr_axi_up (
+       .s_axi_aclk    (clk),
+       .s_axi_aresetn (rst_n),
+-      .s_axi_awid    ({3'b0, m_awid}),
+-      .s_axi_awaddr  (m_awaddr[30:0]),
+-      .s_axi_awlen   (m_awlen),
+-      .s_axi_awsize  (m_awsize),
+-      .s_axi_awburst (m_awburst),
+-      .s_axi_awlock  (m_awlock),
+-      .s_axi_awcache (m_awcache),
+-      .s_axi_awprot  (m_awprot),
+-      .s_axi_awregion(m_awregion),
+-      .s_axi_awqos   (m_awqos),
+-      .s_axi_awvalid (m_awvalid),
+-      .s_axi_awready (m_awready),
+-      .s_axi_wdata   (m_wdata),
+-      .s_axi_wstrb   (m_wstrb),
+-      .s_axi_wlast   (m_wlast),
+-      .s_axi_wvalid  (m_wvalid),
+-      .s_axi_wready  (m_wready),
+-      .s_axi_bid     (up_bid),
+-      .s_axi_bresp   (m_bresp),
+-      .s_axi_bvalid  (m_bvalid),
+-      .s_axi_bready  (m_bready),
+-      .s_axi_arid    ({3'b0, m_arid}),
+-      .s_axi_araddr  (m_araddr[30:0]),
+-      .s_axi_arlen   (m_arlen),
+-      .s_axi_arsize  (m_arsize),
+-      .s_axi_arburst (m_arburst),
+-      .s_axi_arlock  (m_arlock),
+-      .s_axi_arcache (m_arcache),
+-      .s_axi_arprot  (m_arprot),
+-      .s_axi_arregion(m_arregion),
+-      .s_axi_arqos   (m_arqos),
+-      .s_axi_arvalid (m_arvalid),
+-      .s_axi_arready (m_arready),
+-      .s_axi_rid     (up_rid),
+-      .s_axi_rdata   (m_rdata),
+-      .s_axi_rresp   (m_rresp),
+-      .s_axi_rlast   (m_rlast),
+-      .s_axi_rvalid  (m_rvalid),
+-      .s_axi_rready  (m_rready),
++      .s_axi_awid    (x_awid),
++      .s_axi_awaddr  (x_awaddr),
++      .s_axi_awlen   (x_awlen),
++      .s_axi_awsize  (x_awsize),
++      .s_axi_awburst (x_awburst),
++      .s_axi_awlock  (x_awlock),
++      .s_axi_awcache (x_awcache),
++      .s_axi_awprot  (x_awprot),
++      .s_axi_awregion(x_awregion),
++      .s_axi_awqos   (x_awqos),
++      .s_axi_awvalid (x_awvalid),
++      .s_axi_awready (x_awready),
++      .s_axi_wdata   (x_wdata),
++      .s_axi_wstrb   (x_wstrb),
++      .s_axi_wlast   (x_wlast),
++      .s_axi_wvalid  (x_wvalid),
++      .s_axi_wready  (x_wready),
++      .s_axi_bid     (x_bid),
++      .s_axi_bresp   (x_bresp),
++      .s_axi_bvalid  (x_bvalid),
++      .s_axi_bready  (x_bready),
++      .s_axi_arid    (x_arid),
++      .s_axi_araddr  (x_araddr),
++      .s_axi_arlen   (x_arlen),
++      .s_axi_arsize  (x_arsize),
++      .s_axi_arburst (x_arburst),
++      .s_axi_arlock  (x_arlock),
++      .s_axi_arcache (x_arcache),
++      .s_axi_arprot  (x_arprot),
++      .s_axi_arregion(x_arregion),
++      .s_axi_arqos   (x_arqos),
++      .s_axi_arvalid (x_arvalid),
++      .s_axi_arready (x_arready),
++      .s_axi_rid     (x_rid),
++      .s_axi_rdata   (x_rdata),
++      .s_axi_rresp   (x_rresp),
++      .s_axi_rlast   (x_rlast),
++      .s_axi_rvalid  (x_rvalid),
++      .s_axi_rready  (x_rready),
+       .m_axi_aclk    (ui_clk),
+       .m_axi_aresetn (~ui_rst),
+       .m_axi_awaddr  (c_awaddr),
+@@ -397,8 +719,8 @@ module chip_vcu118 #(
+       .m_axi_rvalid  (c_rvalid),
+       .m_axi_rready  (c_rready)
+   );
+-  assign m_bid = up_bid[0];
+-  assign m_rid = up_rid[0];
++  assign m_bid = s_bid[0];
++  assign m_rid = s_rid[0];
+ 
+   // Calibration status into the main clock domain (GPIO input bit 0).
+   xpm_cdc_single #(
+@@ -496,7 +818,7 @@ module chip_vcu118 #(
+       .spim_flash_rst_no(),
+       .gpio_o           (gpio_out),
+       .gpio_en_o        (gpio_en),
+-      .gpio_i           ({4'h0, ddr_por_rst, eos_sync, ddr_run_sync, ddr_calib_sync}),
++      .gpio_i           ({3'h0, pcie_lnk_up_sync, ddr_por_rst, eos_sync, ddr_run_sync, ddr_calib_sync}),
+       // Camera / ISP: no sensor on this board
+       .ISP_DVP_D0       (1'b0),
+       .ISP_DVP_D1       (1'b0),
+diff --git a/fpga/vcu118_pcie_ip.tcl b/fpga/vcu118_pcie_ip.tcl
+new file mode 100644
+index 0000000..e95e589
+--- /dev/null
++++ b/fpga/vcu118_pcie_ip.tcl
+@@ -0,0 +1,192 @@
++# PCIe (XDMA) for the VCU118 edge connector, sharing DDR4 C1 with the SoC.
++#
++#   host PC --PCIe Gen3 x8--> pcie_xdma (axi_aclk 250 MHz, AXI-MM 256 bit)
++#            --> pcie_axi_cdc (async, 250 MHz -> 50 MHz main clock)
++#            --> ddr_axi_xbar S01 \
++#   SoC io_ddr_mem_axi --------> S00 -> M00 --> ddr4_c1_axi_up --> ddr4_c1
++#
++# Card address 0 of the DMA = DDR offset 0 = SoC address 0x8000_0000.
++# Only the low 31 bits of the XDMA address reach the crossbar (2 GB window).
++# The SoC keeps working exactly as before when no host talks to the card:
++# the crossbar only arbitrates, and the 50 MHz side is the one that already
++# meets timing. Only Xilinx IP (XDMA, converters) runs at 250/300 MHz.
++#
++# Pins follow the same rule as DDR4 C1 (vcu118_ddr4_c1_ip.tcl): nothing is
++# hand-typed. The XDMA lanes and PERST# come from the board interfaces set on
++# the IP; the reference clock enters through an IBUFDS_GTE4 in chip_vcu118.sv,
++# so vcu118_pcie_pins_xdc writes its PACKAGE_PIN from the board files.
++#
++# Usage (inside an open project, after vcu118_ddr4_c1_all):
++#   source vcu118_pcie_ip.tcl; vcu118_pcie_all <ipdir> <xdc out>
++# Prints one "PCIE:" line per decision.
++
++proc vcu118_pcie_log {msg} { puts "PCIE: $msg" }
++
++proc vcu118_pcie_try {ip prop val} {
++    if {[catch {set_property $prop $val $ip} err]} {
++        vcu118_pcie_log "could not set $prop=$val ($err)"
++        return 0
++    }
++    set now [get_property $prop $ip]
++    if {$now ne $val} {
++        vcu118_pcie_log "set $prop=$val but it reads back $now"
++        return 0
++    }
++    return 1
++}
++
++proc vcu118_pcie_need {ip prop val} {
++    if {![vcu118_pcie_try $ip $prop $val]} {
++        error "PCIE: [get_property NAME $ip] needs $prop=$val (chip_vcu118.sv is written for it)"
++    }
++}
++
++# First board interface whose name matches any of the patterns.
++proc vcu118_pcie_board_if {patterns} {
++    foreach i [lsort [get_board_part_interfaces -quiet *]] {
++        foreach p $patterns {
++            if {[string match -nocase $p $i]} { return $i }
++        }
++    }
++    return ""
++}
++
++proc vcu118_pcie_xdma {ipdir} {
++    set lanes_if [vcu118_pcie_board_if {pci_express_x8 *pcie*x8*}]
++    set rst_if   [vcu118_pcie_board_if {pcie_perstn *pcie*perst*}]
++    if {$lanes_if eq ""} {
++        error "PCIE: no x8 PCIe board interface; have: [get_board_part_interfaces -quiet *]"
++    }
++    vcu118_pcie_log "lanes interface $lanes_if, reset interface [expr {$rst_if eq {} ? {(none)} : $rst_if}]"
++
++    if {[llength [get_ips -quiet pcie_xdma]] == 0} {
++        file mkdir $ipdir
++        create_ip -name xdma -vendor xilinx.com -library ip -module_name pcie_xdma -dir $ipdir
++    }
++    set ip [get_ips pcie_xdma]
++    # Board interfaces first: they pick the PCIe block, the GT quads and the
++    # PERST# pin, and may reset other settings.
++    vcu118_pcie_need $ip CONFIG.PCIE_BOARD_INTERFACE $lanes_if
++    if {$rst_if ne ""} { vcu118_pcie_try $ip CONFIG.SYS_RST_N_BOARD_INTERFACE $rst_if }
++
++    # Gen3 x8, AXI memory-mapped DMA, 256-bit user side at 250 MHz,
++    # one H2C (host -> card: model load) and one C2H (card -> host) channel.
++    vcu118_pcie_need $ip CONFIG.functional_mode DMA
++    vcu118_pcie_need $ip CONFIG.mode_selection Advanced
++    vcu118_pcie_need $ip CONFIG.pl_link_cap_max_link_width X8
++    vcu118_pcie_need $ip CONFIG.pl_link_cap_max_link_speed 8.0_GT/s
++    vcu118_pcie_need $ip CONFIG.axi_data_width 256_bit
++    vcu118_pcie_need $ip CONFIG.axisten_freq 250
++    vcu118_pcie_try  $ip CONFIG.ref_clk_freq 100_MHz
++    vcu118_pcie_try  $ip CONFIG.xdma_rnum_chnl 1
++    vcu118_pcie_try  $ip CONFIG.xdma_wnum_chnl 1
++    vcu118_pcie_try  $ip CONFIG.xdma_axi_intf_mm AXI_Memory_Mapped
++    vcu118_pcie_try  $ip CONFIG.axilite_master_en false
++    vcu118_pcie_try  $ip CONFIG.xdma_pcie_64bit_en false
++    vcu118_pcie_try  $ip CONFIG.pf0_device_id 9038
++
++    foreach p {PCIE_BOARD_INTERFACE SYS_RST_N_BOARD_INTERFACE functional_mode
++               pl_link_cap_max_link_width pl_link_cap_max_link_speed axi_data_width
++               axisten_freq ref_clk_freq xdma_rnum_chnl xdma_wnum_chnl axi_id_width
++               axi_addr_width pcie_blk_locn select_quad pf0_device_id} {
++        vcu118_pcie_log "xdma $p = [get_property -quiet CONFIG.$p $ip]"
++    }
++    return $ip
++}
++
++# XDMA master (250 MHz) -> main clock (50 MHz). Same data and ID width.
++proc vcu118_pcie_axi_cdc {ipdir} {
++    if {[llength [get_ips -quiet pcie_axi_cdc]] == 0} {
++        create_ip -name axi_clock_converter -vendor xilinx.com -library ip \
++            -module_name pcie_axi_cdc -dir $ipdir
++    }
++    set ip [get_ips pcie_axi_cdc]
++    foreach {p v} {PROTOCOL AXI4 DATA_WIDTH 256 ADDR_WIDTH 31 ID_WIDTH 4 ACLK_ASYNC 1} {
++        vcu118_pcie_need $ip CONFIG.$p $v
++    }
++    foreach p {PROTOCOL DATA_WIDTH ADDR_WIDTH ID_WIDTH ACLK_ASYNC SYNCHRONIZATION_STAGES} {
++        vcu118_pcie_log "cdc $p = [get_property -quiet CONFIG.$p $ip]"
++    }
++    return $ip
++}
++
++# Two masters (S00 SoC, S01 PCIe) onto the one DDR path, main clock.
++# ID_WIDTH 5: one bit tells the two masters apart, four are left for each.
++proc vcu118_pcie_xbar {ipdir} {
++    if {[llength [get_ips -quiet ddr_axi_xbar]] == 0} {
++        create_ip -name axi_crossbar -vendor xilinx.com -library ip \
++            -module_name ddr_axi_xbar -dir $ipdir
++    }
++    set ip [get_ips ddr_axi_xbar]
++    foreach {p v} {PROTOCOL AXI4 NUM_SI 2 NUM_MI 1 DATA_WIDTH 256 ADDR_WIDTH 31 ID_WIDTH 5
++                   S00_THREAD_ID_WIDTH 1 S01_THREAD_ID_WIDTH 4
++                   M00_A00_BASE_ADDR 0x0000000000000000 M00_A00_ADDR_WIDTH 31} {
++        vcu118_pcie_need $ip CONFIG.$p $v
++    }
++    foreach p {PROTOCOL NUM_SI NUM_MI DATA_WIDTH ADDR_WIDTH ID_WIDTH S00_THREAD_ID_WIDTH
++               S01_THREAD_ID_WIDTH M00_A00_BASE_ADDR M00_A00_ADDR_WIDTH CONNECTIVITY_MODE
++               STRATEGY} {
++        vcu118_pcie_log "xbar $p = [get_property -quiet CONFIG.$p $ip]"
++    }
++    return $ip
++}
++
++# PACKAGE_PIN for the reference clock (and PERST# if the IP does not place it)
++# from the board files. Writes an XDC and returns its path.
++proc vcu118_pcie_pins_xdc {xdc} {
++    set clk_if [vcu118_pcie_board_if {pcie_refclk *pcie*refclk* *pcie*clk*}]
++    set rst_if [vcu118_pcie_board_if {pcie_perstn *pcie*perst*}]
++    if {$clk_if eq ""} {
++        error "PCIE: no PCIe reference clock board interface; have: [get_board_part_interfaces -quiet *]"
++    }
++    set fh [open $xdc w]
++    puts $fh "# Generated by vcu118_pcie_ip.tcl from the VCU118 board files. Do not edit."
++    set placed {}
++    foreach {ifc ports} [list $clk_if {pcie_refclk_p pcie_refclk_n} $rst_if {pcie_perst_n}] {
++        if {$ifc eq ""} { continue }
++        foreach pin [get_board_part_pins -quiet -of_objects [get_board_part_interfaces $ifc]] {
++            set loc [get_property -quiet LOC $pin]
++            set ios [get_property -quiet IOSTANDARD $pin]
++            vcu118_pcie_log "board pin $ifc/$pin LOC=$loc IOSTANDARD=$ios"
++            if {$loc eq ""} { continue }
++            if {[llength $ports] == 1} {
++                set port [lindex $ports 0]
++            } elseif {[regexp -nocase {(_n|n)$} $pin]} {
++                set port [lindex $ports 1]
++            } else {
++                set port [lindex $ports 0]
++            }
++            puts $fh "set_property PACKAGE_PIN $loc \[get_ports $port\]"
++            if {$ios ne "" && $port eq "pcie_perst_n"} {
++                puts $fh "set_property IOSTANDARD $ios \[get_ports $port\]"
++            }
++            lappend placed $port
++        }
++    }
++    # 100 MHz reference from the host slot (the XDMA example design does the
++    # same in its top-level XDC). PERST# is asynchronous to everything.
++    puts $fh "create_clock -name pcie_refclk -period 10.000 \[get_ports pcie_refclk_p\]"
++    puts $fh "set_false_path -from \[get_ports pcie_perst_n\]"
++    close $fh
++    foreach need {pcie_refclk_p pcie_refclk_n pcie_perst_n} {
++        if {[lsearch $placed $need] < 0} {
++            error "PCIE: board files gave no pin for $need (placed: $placed)"
++        }
++    }
++    vcu118_pcie_log "wrote $xdc ($placed)"
++    return $xdc
++}
++
++# Everything chip_vcu118.sv instantiates for PCIe. Also widens the DDR
++# upsizer's ID to the crossbar's 5 bits.
++proc vcu118_pcie_all {ipdir xdc} {
++    set x [vcu118_pcie_xdma $ipdir]
++    set c [vcu118_pcie_axi_cdc $ipdir]
++    set b [vcu118_pcie_xbar $ipdir]
++    set up [get_ips -quiet ddr4_c1_axi_up]
++    if {$up eq ""} { error "PCIE: run vcu118_ddr4_c1_all first (ddr4_c1_axi_up missing)" }
++    vcu118_pcie_need $up CONFIG.SI_ID_WIDTH 5
++    vcu118_pcie_log "axi_up SI_ID_WIDTH = [get_property CONFIG.SI_ID_WIDTH $up]"
++    vcu118_pcie_pins_xdc $xdc
++    return [list $x $c $b]
++}
+diff --git a/fpga/vcu118_setup_hooks.tcl b/fpga/vcu118_setup_hooks.tcl
+index 19e333f..5dc8372 100644
+--- a/fpga/vcu118_setup_hooks.tcl
++++ b/fpga/vcu118_setup_hooks.tcl
+@@ -54,6 +54,12 @@ if {$changed} {
+ source "${workroot}/vcu118_ddr4_c1_ip.tcl"
+ vcu118_ddr4_c1_all "${workroot}/ip"
+ 
++# PCIe Gen3 x8 XDMA + clock converter + DDR crossbar (patch 0014), and the
++# reference clock / PERST# pins from the board files.
++source "${workroot}/vcu118_pcie_ip.tcl"
++vcu118_pcie_all "${workroot}/ip" "${workroot}/vcu118_pcie_pins.xdc"
++add_files -fileset constrs_1 -norecurse "${workroot}/vcu118_pcie_pins.xdc"
++
+ # Register optimization, placement quality gate, and post-route assessment hooks
+ set_property STEPS.OPT_DESIGN.TCL.PRE "${workroot}/vcu118_pre_opt_hooks.tcl" [get_runs impl_1]
+ set_property STEPS.PLACE_DESIGN.TCL.POST "${workroot}/vivado_post_place_hooks.tcl" [get_runs impl_1]
+-- 
+2.43.0
+

@@ -279,6 +279,26 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 - 유실 원인은 VirtualBox USB 경로로 추정 (서버 직결에서는 0). 측정으로 분리하지는 않음
 - CI: `.github/workflows/board-test.yml` (self-hosted `vcu118` 러너, 서버 `~/actions-runner-vcu118`)
 
+## [11/16] PCIe 패치 0014 작성 (빌드 전)
+
+- 배경: 11/11 보드를 sota-AIP 의 PCIe 슬롯에 꽂았지만 `lspci` 에 Xilinx(10ee) 장치가 없음(11/16 재확인).
+  원인은 비트스트림에 PCIe IP 가 없기 때문. USB(JTAG·UART)는 정상, 서버 Secure Boot 꺼짐(커널 7.0.0-42)
+- 설계 (`patches/0014-vcu118-pcie-xdma.patch`)
+  - `pcie_xdma`: Gen3 x8, AXI-MM DMA, 256비트 @ 250 MHz, H2C 1 + C2H 1. 레인·PERST# 는 보드 인터페이스(pci_express_x8, pcie_perstn)
+  - `pcie_axi_cdc`: 250 → 50 MHz 비동기 변환
+  - `ddr_axi_xbar`: 50 MHz 에서 2:1 (S00 SoC, S01 PCIe) → 기존 `ddr4_c1_axi_up` (ID 4 → 5비트). 300 MHz 쪽은 그대로
+  - 카드 주소 0 = DDR 오프셋 0 = SoC 0x8000_0000. GPIO 입력 bit 4 = PCIe link up
+  - 기준 클럭(IBUFDS_GTE4)·PERST# 핀은 손으로 적지 않고 빌드 때 보드 파일에서 XDC 생성(`vcu118_pcie_pins.xdc`)
+  - `check_pin_assignments`: pci_exp_* 는 XDMA GT LOC 로 배치되므로 예외
+- 빌드 없이 한 검사
+  - 0001~0013 위에 `git apply --check` 통과
+  - Tcl 3개 문법(tclsh `info complete`, proc 정의)
+  - RTL: 가정한 IP 포트 폭으로 만든 스텁 + pyslang 으로 elaboration, 폭 경고 0 (일부러 틀린 예제로 검사기 동작 확인)
+- 아직 확인 안 된 것: 실제 Vivado IP 포트 이름·폭, 보드 인터페이스 이름, GT LOC 생성 여부
+  → `coral pcie-probe` (VM, 몇 분; 메일박스 `probe` 끝에 같이 돌도록 함). 통과하면 빌드(승인 필요)
+- 빌드 후 순서: 비트스트림 → PCIe 재검색(rescan 또는 웜 리부트) → XDMA 드라이버 → `ddr_run.py` PCIe 적재 경로
+- 기대 효과: 적재만 빨라짐(vgg 216 s, yolo 167 s → 수 초 이하, 추정). 추론 시간은 그대로
+
 ## [진행 예정]
 
 - (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음

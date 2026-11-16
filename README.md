@@ -169,6 +169,7 @@ LED: `0` 클럭 lock · `1` 하트비트 · `2` halted · `3` fault · `5` DDR4 
 | 0011 | DDR4 bring-up 가시성 (LED, GPIO, MIG 디버그 허브) |
 | 0012 | DDR4 파워온 리셋 카운터 |
 | 0013 | DDR4 입력 클럭: `TimePeriod 1000` 요청 삭제 (VCO 4250 → 1500 MHz) |
+| 0014 | PCIe Gen3 x8 XDMA → DDR4 C1 (호스트 DMA 적재, **아직 빌드 안 함**: `coral pcie-probe` 먼저) |
 
 ## 알려진 한계
 

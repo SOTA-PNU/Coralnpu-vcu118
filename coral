@@ -20,7 +20,12 @@
 #                             bitstream (builds before patch 0010), ~15 min
 #   ./coral ddr4-probe [synth] generate the DDR4 C1 controller IP only (minutes) and
 #                             print its settings and ports -> out/ddr4_probe.txt;
-#                             "synth" also checks every DDR pin gets placed (~20 min)
+#                             "synth" also checks every DDR pin gets placed (~20 min);
+#                             runs pcie-probe afterwards
+#   ./coral pcie-probe        generate the PCIe XDMA, clock converter and DDR crossbar
+#                             IPs of patch 0014, check their ports against
+#                             chip_vcu118.sv and print the board pins
+#                             -> out/pcie_probe.txt (minutes)
 #
 # Environment overrides: CONFIG, HW_SERVER, UART_DEV, BOARD_SSH* (see config.sh).
 set -euo pipefail
@@ -495,12 +500,36 @@ cmd_ddr4_probe() {
   rm -rf "${fakehome}"
   grep -q "^PROBE: done" "${report}" || die "probe did not finish; see ${report}"
   info "saved ${report}"
+  # The VM mailbox only knows "probe" (= this command), so the PCIe check
+  # rides along: a few minutes, no synthesis.
+  [[ -f "${ROOT}/vivado/pcie_probe.tcl" ]] && cmd_pcie_probe
+}
+
+# Patch 0014 (PCIe XDMA) without a build: create the IPs the way the build
+# hook does, compare their instantiation templates with what chip_vcu118.sv
+# connects, and print the board-file pins (reference clock, PERST#).
+cmd_pcie_probe() {
+  need_vivado
+  local work="${OUT}/pcie_probe" report="${OUT}/pcie_probe.txt" fakehome
+  mkdir -p "${OUT}"
+  if [[ -z "${XILINXD_LICENSE_FILE:-}" && -f "${HOME}/.Xilinx/Xilinx.lic" ]]; then
+    export XILINXD_LICENSE_FILE="${HOME}/.Xilinx/Xilinx.lic"
+  fi
+  fakehome="$(mktemp -d)"
+  info "generating the PCIe IPs of patch 0014 in ${work}"
+  (cd "${OUT}" && HOME="${fakehome}" vivado -mode batch -nojournal -nolog -notrace       -source "${ROOT}/vivado/pcie_probe.tcl" -tclargs "${work}") 2>&1 |
+    grep -E "^(PROBE|PCIE|DDR4C1):|ERROR|CRITICAL" | tee "${report}"
+  rm -rf "${fakehome}"
+  grep -q "^PROBE: done" "${report}" || die "pcie probe did not finish; see ${report}"
+  grep -q "^PROBE: port check ok" "${report}" || die "port mismatch; see ${report}"
+  info "saved ${report}"
 }
 
 # ---------------------------------------------------------------------------
 sub="${1:-}"; shift || true
 case "${sub}" in
   ddr4-probe) cmd_ddr4_probe "$@" ;;
+  pcie-probe) cmd_pcie_probe "$@" ;;
   ddr4-fw)    cmd_ddr4_fw "$@" ;;
   doctor|setup|build|resume|sw|run|program|load|console|up|deploy|model) "cmd_${sub}" "$@" ;;
   *) sed -n '2,/^# Environment/p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
