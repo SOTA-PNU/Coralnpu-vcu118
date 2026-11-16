@@ -49,6 +49,7 @@ proc ports_of {work name} {
 set expect(pcie_xdma) {
     sys_clk 1 sys_clk_gt 1 sys_rst_n 1 user_lnk_up 1 pci_exp_txp 8 pci_exp_txn 8
     pci_exp_rxp 8 pci_exp_rxn 8 axi_aclk 1 axi_aresetn 1 usr_irq_req 1
+    cfg_mgmt_addr 19 cfg_mgmt_write 1 cfg_mgmt_write_data 32 cfg_mgmt_byte_enable 4 cfg_mgmt_read 1
     m_axi_awready 1 m_axi_wready 1 m_axi_bid 4 m_axi_bresp 2 m_axi_bvalid 1
     m_axi_arready 1 m_axi_rid 4 m_axi_rdata 256 m_axi_rresp 2 m_axi_rlast 1
     m_axi_rvalid 1 m_axi_awid 4 m_axi_awaddr 64 m_axi_awlen 8 m_axi_awsize 3
@@ -76,7 +77,7 @@ foreach {n w} [axi_side s_axi 5 31 256 0] { lappend xs $n [expr {2 * $w}] }
 set expect(ddr_axi_xbar) [concat {aclk 1 aresetn 1} $xs [axi_side m_axi 5 31 256 1]]
 # axi_up: slave side now 5-bit ID; master side unchanged (no ID)
 set ms {}
-foreach {n w} [axi_side m_axi 5 31 512 1] { if {![string match *id $n]} { lappend ms $n $w } }
+foreach {n w} [axi_side m_axi 5 31 512 1] { if {![regexp {_(aw|ar|b|r)id$} $n]} { lappend ms $n $w } }
 set expect(ddr4_c1_axi_up) [concat {s_axi_aclk 1 s_axi_aresetn 1 m_axi_aclk 1 m_axi_aresetn 1} \
     [axi_side s_axi 5 31 256 1] $ms]
 
@@ -110,12 +111,12 @@ set nloc 0
 foreach f [get_files -quiet -of_objects [get_files pcie_xdma.xci] -filter {FILE_TYPE == XDC}] {
     set fh [open $f r]
     foreach line [split [read $fh] "\n"] {
-        if {[regexp -nocase {LOC|PACKAGE_PIN} $line] && ![string match "#*" [string trim $line]]} {
+        if {[regexp {set_property\s.*\m(LOC|PACKAGE_PIN)\M} $line] && ![string match "#*" [string trim $line]]} {
             if {$nloc < 24} { puts "PROBE: xdma xdc [file tail $f]: [string trim $line]" }
             incr nloc
         }
     }
     close $fh
 }
-puts "PROBE: xdma LOC/PACKAGE_PIN lines: $nloc"
+puts "PROBE: xdma LOC/PACKAGE_PIN lines: $nloc (GT channels must be among them)"
 puts "PROBE: done"

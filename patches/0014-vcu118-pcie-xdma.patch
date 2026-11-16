@@ -1,13 +1,14 @@
-From 251b7bfe6744ba5c09f0e75b25366da423bca6f4 Mon Sep 17 00:00:00 2001
+From 87e44025e6df12c8da7e8c2bf27527ae635aea04 Mon Sep 17 00:00:00 2001
 From: Donghun Yu <ehdgns1083@pusan.ac.kr>
-Date: Mon, 16 Nov 2026 16:44:58 +0900
+Date: Mon, 16 Nov 2026 17:05:46 +0900
 Subject: [PATCH] fpga/vcu118: PCIe Gen3 x8 XDMA into DDR4 C1
 
 Host DMA into the on-board DDR4 through the edge connector, so a model can
 be loaded over PCIe instead of the 74 KB/s USB-UART.
 
 - pcie_xdma: Gen3 x8, AXI-MM DMA, 256-bit at 250 MHz, 1 H2C + 1 C2H.
-  Lanes and PERST# from the board interfaces (pci_express_x8, pcie_perstn).
+  Lanes and PERST# from the board interfaces (pci_express_x8, pcie_perstn);
+  cfg_mgmt_* tied off.
 - pcie_axi_cdc: async 250 MHz -> 50 MHz main clock.
 - ddr_axi_xbar: 2:1 crossbar on the main clock (S00 SoC, S01 PCIe) in
   front of ddr4_c1_axi_up, whose ID widens 4 -> 5. The 300 MHz side is
@@ -20,10 +21,10 @@ be loaded over PCIe instead of the 74 KB/s USB-UART.
  fpga/BUILD                     |   1 +
  fpga/check_pin_assignments.tcl |   7 +
  fpga/chip_vcu118.core          |   3 +-
- fpga/rtl/chip_vcu118.sv        | 410 +++++++++++++++++++++++++++++----
+ fpga/rtl/chip_vcu118.sv        | 419 +++++++++++++++++++++++++++++----
  fpga/vcu118_pcie_ip.tcl        | 192 +++++++++++++++
  fpga/vcu118_setup_hooks.tcl    |   6 +
- 6 files changed, 574 insertions(+), 45 deletions(-)
+ 6 files changed, 583 insertions(+), 45 deletions(-)
  create mode 100644 fpga/vcu118_pcie_ip.tcl
 
 diff --git a/fpga/BUILD b/fpga/BUILD
@@ -78,7 +79,7 @@ index 874e4ea..0b92915 100644
        - vcu118_bitstream_pre_hooks.tcl: { file_type: user, copyto: vcu118_bitstream_pre_hooks.tcl }
        - vcu118_bitstream_post_hooks.tcl: { file_type: user, copyto: vcu118_bitstream_post_hooks.tcl }
 diff --git a/fpga/rtl/chip_vcu118.sv b/fpga/rtl/chip_vcu118.sv
-index c1e3a3a..189f9cf 100644
+index c1e3a3a..ac77c31 100644
 --- a/fpga/rtl/chip_vcu118.sv
 +++ b/fpga/rtl/chip_vcu118.sv
 @@ -43,6 +43,12 @@
@@ -121,7 +122,7 @@ index c1e3a3a..189f9cf 100644
  
    // Controller side, ui_clk (300 MHz)
    logic [30:0]  c_awaddr, c_araddr;
-@@ -316,49 +331,356 @@ module chip_vcu118 #(
+@@ -316,49 +331,365 @@ module chip_vcu118 #(
        .c0_ddr4_s_axi_rdata    (c_rdata)
    );
  
@@ -172,6 +173,15 @@ index c1e3a3a..189f9cf 100644
 +      .usr_irq_ack     (),
 +      .msi_enable      (),
 +      .msi_vector_width(),
++      // Configuration management port (host-side config space access from
++      // the user logic): unused, tied off so no input floats.
++      .cfg_mgmt_addr          (19'b0),
++      .cfg_mgmt_write         (1'b0),
++      .cfg_mgmt_write_data    (32'b0),
++      .cfg_mgmt_byte_enable   (4'b0),
++      .cfg_mgmt_read          (1'b0),
++      .cfg_mgmt_read_data     (),
++      .cfg_mgmt_read_write_done(),
 +      .m_axi_awready   (p_awready),
 +      .m_axi_wready    (p_wready),
 +      .m_axi_bid       (p_bid),
@@ -517,7 +527,7 @@ index c1e3a3a..189f9cf 100644
        .m_axi_aclk    (ui_clk),
        .m_axi_aresetn (~ui_rst),
        .m_axi_awaddr  (c_awaddr),
-@@ -397,8 +719,8 @@ module chip_vcu118 #(
+@@ -397,8 +728,8 @@ module chip_vcu118 #(
        .m_axi_rvalid  (c_rvalid),
        .m_axi_rready  (c_rready)
    );
@@ -528,7 +538,7 @@ index c1e3a3a..189f9cf 100644
  
    // Calibration status into the main clock domain (GPIO input bit 0).
    xpm_cdc_single #(
-@@ -496,7 +818,7 @@ module chip_vcu118 #(
+@@ -496,7 +827,7 @@ module chip_vcu118 #(
        .spim_flash_rst_no(),
        .gpio_o           (gpio_out),
        .gpio_en_o        (gpio_en),
