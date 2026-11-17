@@ -299,6 +299,19 @@ CoralNPU (상류 `google-coral/coralnpu` @ 15573b69) 를 AMD VCU118 (xcvu9p-flga
 - 빌드 후 순서: 비트스트림 → PCIe 재검색(rescan 또는 웜 리부트) → XDMA 드라이버 → `ddr_run.py` PCIe 적재 경로
 - 기대 효과: 적재만 빨라짐(vgg 216 s, yolo 167 s → 수 초 이하, 추정). 추론 시간은 그대로
 
+## [11/17] DDR4 보정 실패 — PCIe 슬롯 장착 이후
+
+- 증상: `coral model` 이 "DDR not calibrated after 5 s" (GPIO 0x06: 컨트롤러 리셋 해제·EOS 는 정상, calibrated=0).
+  `coral program` 으로 다시 올려도 같음. 비트스트림은 11/10 과 동일
+- 경과: 11/09 board-test 성공, 11/10 모델 4개 정상 → 11/11 보드를 서버 PCIe 슬롯에 장착(전원 재투입, RVV 만 확인)
+  → 11/16 board-test #3 (주간) 실패 → 11/17 재현
+- MIG 디버그 허브(0011)로 읽은 상태 (Vivado Lab `get_hw_migs` / `refresh_hw_mig`):
+  - `CAL_STATUS.RANK0.01_DQS_GATE = FAIL`, `DDR_CAL_ERROR_CODE = 004`
+  - "Pattern not found on GT_STATUS, all samples were 0. Expecting to sample the preamble. Error found on Rank 0, Byte 0, Nibble 1."
+- 해석: 첫 단계에서 DRAM 이 읽기 응답을 전혀 주지 않음(모두 0). 설정·RTL 이 아니라 보드 상태(전원·리셋·장착) 의심
+- 다음: 보드 12 V(J15) 연결·전원 스위치 확인 → 완전 전원 재투입 → 재시험. 안 되면 PCIe 슬롯에서 빼고 11/10 상태로 시험
+- 영향: 호스트 CPU·GPU 사용량 측정(모델 추론 중)이 보류됨
+
 ## [진행 예정]
 
 - (보류) 매트릭스 판: VU13P 급 보드에서. `vcu118_vme_test` 는 준비돼 있음
